@@ -100,3 +100,26 @@ This project pins Python to 3.12.8 using both `.python-version` and `PYTHON_VERS
 - Only the generated UI item is visible in Creative.
 - Generated UI item name is based on the addon pack name without BP/RP suffix: `<Addon Name> item ui`.
 - Armor selection UI includes the SamSoSleepy branding line.
+
+## Update: โหมดรวมแอดออน 2 ไฟล์
+
+เวอร์ชันนี้เพิ่ม dropdown ที่ panel แทนปุ่มเดี่ยว:
+
+- 🎨 รวมไอเท็มเป็น UI
+- 📦 รวมแอดออน
+
+### ระบบรวมแอดออนทำอะไรบ้าง
+
+- รับ addon 2 ไฟล์ใน ticket เดียว
+- แตก BP/RP ของทั้งสองไฟล์
+- รวมเป็น `BP_merged` และ `RP_merged`
+- สุ่ม UUID ใหม่ให้ manifest ทั้ง BP/RP
+- แยก script เดิมเป็น `scripts/addon_<prefix>/...`
+- สร้าง `scripts/main.js` ใหม่เพื่อ import script entry ของแต่ละ addon
+- prefix identifiers / geometry / animation / controller / texture keys / texture paths เพื่อลดไฟล์ชนกัน
+- merge `item_texture.json`, `texts/*.lang`, `languages.json`
+- แนบ `MERGE_REPORT.txt` ใน addon ที่ส่งออกเพื่อดูรายงานและ warning
+
+### ข้อจำกัดของโหมดรวมแอดออน
+
+ระบบกันชนแบบอัตโนมัติครอบคลุม resource/identifier ที่เจอบ่อยมากใน addon แบบ item/attachable/geometry/animation/texture แต่ถ้า addon มี script ที่สร้าง identifier แบบ dynamic เช่นเอา string มาต่อเองใน runtime บอทจะไม่สามารถรู้เจตนาได้ 100% ดังนั้นควรทดสอบในเกมหลังรวมทุกครั้ง
