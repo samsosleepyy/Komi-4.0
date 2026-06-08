@@ -56,6 +56,62 @@ def _json_files(root: Path) -> Iterable[Path]:
         yield path
 
 
+def _collect_defined_dot_symbols(root: Path) -> Set[str]:
+    """Collect dot-style resource identifiers that are actually defined by this pack.
+
+    Important: values such as geometry.humanoid.customSlim are built-in Bedrock
+    references in many MagicSkin/Blockbench-style addons. They must not be
+    renamed unless the addon actually defines them, otherwise attachables will
+    point to missing geometry.
+    """
+    defined: Set[str] = set()
+    for path in root.rglob('*.json'):
+        if path.name == 'manifest.json':
+            continue
+        try:
+            data = _read_json(path)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            geometries = data.get('minecraft:geometry')
+            if isinstance(geometries, list):
+                for geo in geometries:
+                    ident = geo.get('description', {}).get('identifier') if isinstance(geo, dict) else None
+                    if isinstance(ident, str) and ident.startswith('geometry.'):
+                        defined.add(ident)
+            animations = data.get('animations')
+            if isinstance(animations, dict):
+                for key in animations.keys():
+                    if isinstance(key, str) and key.startswith('animation.'):
+                        defined.add(key)
+            controllers = data.get('animation_controllers')
+            if isinstance(controllers, dict):
+                for key in controllers.keys():
+                    if isinstance(key, str) and key.startswith('controller.animation.'):
+                        defined.add(key)
+            render_controllers = data.get('render_controllers')
+            if isinstance(render_controllers, dict):
+                for key in render_controllers.keys():
+                    if isinstance(key, str) and key.startswith('controller.render.'):
+                        defined.add(key)
+    return defined
+
+
+def _is_dot_resource(symbol: str) -> bool:
+    return symbol.startswith(('animation.', 'geometry.', 'controller.animation.', 'controller.render.'))
+
+
+def _is_known_builtin_dot_reference(symbol: str) -> bool:
+    # Built-in Bedrock/vanilla references commonly used by skin/armor addons.
+    if symbol in {'geometry.humanoid', 'geometry.humanoid.custom', 'geometry.humanoid.customSlim', 'controller.render.armor'}:
+        return True
+    if symbol.startswith('geometry.humanoid.'):
+        return True
+    if symbol.startswith('controller.render.armor'):
+        return True
+    return False
+
+
 def _collect_json_symbols(obj: Any, symbols: Set[str]) -> None:
     if isinstance(obj, dict):
         # Common Bedrock identifier containers.
@@ -63,18 +119,30 @@ def _collect_json_symbols(obj: Any, symbols: Set[str]) -> None:
             value = obj['identifier']
             if not value.startswith('minecraft:'):
                 symbols.add(value)
-        # Resource identifiers generally appear as keys.
+        # Resource identifiers generally appear as keys or values.
         for key, value in obj.items():
             if isinstance(key, str):
-                if key.startswith(('animation.', 'geometry.', 'controller.animation.', 'controller.render.')):
+                if _is_dot_resource(key):
+                    symbols.add(key)
+                elif ':' in key and not key.startswith('minecraft:'):
+                    # Attachables often use item identifiers as object keys.
                     symbols.add(key)
             if isinstance(value, str):
-                if value.startswith(('animation.', 'geometry.', 'controller.animation.', 'controller.render.')):
+                if _is_dot_resource(value):
+                    symbols.add(value)
+                elif ':' in value and not value.startswith('minecraft:') and re.match(r'^[a-zA-Z0-9_\-.]+:[a-zA-Z0-9_\-.]+$', value):
                     symbols.add(value)
             _collect_json_symbols(value, symbols)
     elif isinstance(obj, list):
         for value in obj:
             _collect_json_symbols(value, symbols)
+    elif isinstance(obj, str):
+        # List entries such as render_controllers: ["controller.render.foo"]
+        # must be seen, but only definitions will be renamed later.
+        if _is_dot_resource(obj):
+            symbols.add(obj)
+        elif ':' in obj and not obj.startswith('minecraft:') and re.match(r'^[a-zA-Z0-9_\-.]+:[a-zA-Z0-9_\-.]+$', obj):
+            symbols.add(obj)
 
 
 def _prefixed_colon_id(old: str, prefix: str) -> str:
@@ -146,14 +214,22 @@ def _collect_source_pack(source_path: Path, extract_parent: Path, index: int) ->
             continue
         _collect_json_symbols(data, symbols)
 
+    # Only rename dot resources that are actually defined by this addon.
+    # Do not rename built-in references such as geometry.humanoid.customSlim;
+    # MagicSkin-style addons often reference these without shipping geometry files.
+    defined_dot_symbols = _collect_defined_dot_symbols(bp) | _collect_defined_dot_symbols(rp)
+
     mapping: Dict[str, str] = {}
     for symbol in sorted(symbols, key=len, reverse=True):
         if symbol.startswith('minecraft:'):
             continue
         if ':' in symbol:
             mapping[symbol] = _prefixed_colon_id(symbol, prefix)
-        elif symbol.startswith(('animation.', 'geometry.', 'controller.animation.', 'controller.render.')):
-            mapping[symbol] = _prefixed_dot_id(symbol, prefix)
+        elif _is_dot_resource(symbol):
+            if symbol in defined_dot_symbols:
+                mapping[symbol] = _prefixed_dot_id(symbol, prefix)
+            elif not _is_known_builtin_dot_reference(symbol):
+                warnings.append(f'ไม่ได้ rename resource reference ที่ไม่มีไฟล์นิยามใน addon: {symbol}')
 
     texture_key_mapping, texture_ref_mapping = _collect_texture_maps(rp, prefix)
     # Texture *paths* are safe to global-replace because they are explicit resource refs, e.g. textures/item/foo.
@@ -462,7 +538,8 @@ def merge_addons(addon_paths: List[str], work_dir: str) -> str:
         '- Script folders are isolated under BP_merged/scripts/addon_<prefix>/',
         '- main.js imports the original script entry files from both addons.',
         '- UUIDs are regenerated for the merged BP/RP manifests.',
-        '- Identifiers, geometry, animations, render controllers, texture keys and texture paths are prefixed to reduce collisions.',
+        '- Identifiers, defined geometry/animations/controllers, texture keys and texture paths are prefixed to reduce collisions.',
+        '- Built-in references such as geometry.humanoid.customSlim are preserved.',
         '',
         'Warnings:',
         *(warnings or ['- No major warnings detected.']),
