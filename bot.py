@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set
 
 import aiohttp
+from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -421,5 +422,34 @@ async def on_message(message: discord.Message):
             pass
 
 
+async def start_health_server() -> None:
+    """Small HTTP server for Render Web Service deployments.
+
+    Discord bots are long-running gateway clients and normally should be
+    deployed as a Render Background Worker. If the project is deployed as a
+    Web Service instead, Render requires a port to be bound. This health
+    server satisfies that requirement without affecting the Discord bot.
+    """
+    port = int(os.getenv("PORT", "10000"))
+
+    async def health(_request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/healthz", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Health server listening on 0.0.0.0:{port}")
+
+
+async def main() -> None:
+    await start_health_server()
+    await bot.start(DISCORD_TOKEN)
+
+
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    asyncio.run(main())

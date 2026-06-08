@@ -87,3 +87,9 @@ python bot.py
 ## Render Python version note
 
 This project pins Python to 3.12.8 using both `.python-version` and `PYTHON_VERSION` in `render.yaml`. New Render services may default to Python 3.14, where the old stdlib `audioop` module is removed. `requirements.txt` also includes `audioop-lts` for Python >= 3.13 as a fallback.
+
+## Render Web Service port note
+
+เวอร์ชันนี้มี health server เล็ก ๆ ที่ bind กับ `PORT` ของ Render อัตโนมัติ (`/` และ `/healthz`) ดังนั้นถ้า deploy เป็น Web Service จะไม่เจอปัญหา `No open ports detected` แล้ว
+
+อย่างไรก็ตาม สำหรับ Discord bot แนะนำใช้ Background Worker มากกว่า เพราะบอทไม่ได้ต้องรับ traffic HTTP จริง ๆ
