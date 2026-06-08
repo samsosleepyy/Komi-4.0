@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: addon-ui-discord-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: ALLOWED_GUILDS
+        value: "1420339720277463112,1441795602550882334"
+      - key: MAX_PARALLEL_JOBS
+        value: "1"
