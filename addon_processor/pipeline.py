@@ -326,46 +326,6 @@ def _find_animation_file(rp: Path, animation_id: str) -> Optional[Path]:
     return None
 
 
-def _max_animation_key_time(animation: Dict[str, Any]) -> float:
-    max_time = 0.0
-    bones = animation.get("bones")
-    if not isinstance(bones, dict):
-        return max_time
-    for bone_data in bones.values():
-        if not isinstance(bone_data, dict):
-            continue
-        for channel_data in bone_data.values():
-            if not isinstance(channel_data, dict):
-                continue
-            for key in channel_data.keys():
-                try:
-                    max_time = max(max_time, float(key))
-                except (TypeError, ValueError):
-                    continue
-    return max_time
-
-
-def _smooth_loop_animation_length(animation: Dict[str, Any]) -> None:
-    """Remove one-frame idle gaps at the end of looped Blockbench animations.
-
-    Some exported animations have animation_length like 8.0417 while the final
-    keyed pose is at 8.0. In Bedrock this leaves a tiny hold/reset window at
-    the loop seam, which looks like a stutter. If the gap is <= 1/20s, clamp
-    animation_length to the last real keyframe.
-    """
-    if not animation.get("loop"):
-        return
-    length = animation.get("animation_length")
-    if not isinstance(length, (int, float)):
-        return
-    max_time = _max_animation_key_time(animation)
-    if max_time <= 0:
-        return
-    gap = float(length) - max_time
-    if 0 < gap <= 0.06:
-        animation["animation_length"] = round(max_time, 4)
-
-
 def _copy_animation_normalized(src_rp: Path, dst_rp: Path, old_id: str, new_id: str, out_name: str, warnings: List[str]) -> str:
     if not isinstance(old_id, str) or not old_id.startswith("animation."):
         return old_id
@@ -375,18 +335,8 @@ def _copy_animation_normalized(src_rp: Path, dst_rp: Path, old_id: str, new_id: 
         return old_id
     data = _read_json(path)
     animations = data.get("animations")
-    if not isinstance(animations, dict) or old_id not in animations:
-        warnings.append(f"ไม่พบ animation id {old_id} ในไฟล์ {path.name}; preserve reference เดิม")
-        return old_id
-
-    # Output only the animation that is actually referenced by this attachable.
-    # Keeping unrelated original animation IDs duplicated across many generated
-    # files can collide in Bedrock's animation registry and cause loop stutter.
-    copied_animation = animations[old_id]
-    if isinstance(copied_animation, dict):
-        _smooth_loop_animation_length(copied_animation)
-    data["animations"] = {new_id: copied_animation}
-
+    if isinstance(animations, dict) and old_id in animations:
+        animations[new_id] = animations.pop(old_id)
     out = dst_rp / "animations" / f"{out_name}.animation.json"
     _write_json(out, data)
     return new_id
@@ -728,12 +678,13 @@ def _lang_label(display_name: str, slot_key: str) -> str:
 
 def _make_generated_item(identifier: str, icon: str, display_name: str, wearable_slot: str) -> Dict[str, Any]:
     # Armor pieces are real wearable target items used by replaceitem. They must
-    # not appear in the Creative inventory, so description.menu_category is
-    # intentionally omitted. Only the selector UI item gets a menu_category.
+    # not appear in the Creative inventory. Some Bedrock versions still show
+    # custom wearable items when menu_category is omitted, so use the explicit
+    # hidden category used by creator tools: {"category": "none"}.
     return {
         "format_version": "1.20.50",
         "minecraft:item": {
-            "description": {"identifier": identifier},
+            "description": {"identifier": identifier, "menu_category": {"category": "none"}},
             "components": {
                 "minecraft:icon": icon,
                 "minecraft:max_stack_size": 1,
@@ -748,10 +699,10 @@ def _normalize_creative_visibility(items_root: Path, selector_id: str) -> None:
     """Keep only the UI selector visible in Creative.
 
     Bedrock shows custom items in Creative through description.menu_category.
-    Wearable generated/original armor pieces must have that field removed so
-    they behave like command-block/barrier style hidden items: available by
-    give/replaceitem only. The selector UI item is visible in the top-level
-    Equipment category, without any armor sub-group.
+    Wearable generated/original armor pieces must be explicitly placed in
+    category "none" so they are hidden from every Creative tab but still
+    available by /give and replaceitem. The selector UI item is visible in
+    the top-level Equipment category, without any armor sub-group.
     """
     if not items_root.exists():
         return
@@ -771,7 +722,7 @@ def _normalize_creative_visibility(items_root: Path, selector_id: str) -> None:
         if identifier == selector_id:
             desc["menu_category"] = {"category": "equipment"}
         elif "minecraft:wearable" in comps:
-            desc.pop("menu_category", None)
+            desc["menu_category"] = {"category": "none"}
         _write_json(item_path, data)
 
 

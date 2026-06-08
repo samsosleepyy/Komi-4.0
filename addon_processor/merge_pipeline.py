@@ -442,13 +442,13 @@ def _copy_texture_files(source: SourcePack, merged_rp: Path) -> None:
 
 
 def _normalize_merged_creative_visibility(merged_bp: Path) -> None:
-    """Hide wearable armor pieces and move UI/menu items to loose Items.
+    """Hide wearable armor pieces and keep UI/menu items visible in Equipment.
 
     This protects merged UI addons where source armor pieces may still carry a
-    creative menu_category. It removes menu_category from any wearable item so
-    armor pieces stay hidden and can only be used by give/replaceitem. If an
-    item looks like a selector/menu item, it is placed in the top-level
-    Equipment category without an armor sub-group.
+    creative menu_category. Wearable items are moved to explicit category
+    "none" so they are hidden from every Creative tab and can only be used by
+    give/replaceitem. If an item looks like a selector/menu item, it is placed
+    in the top-level Equipment category without an armor sub-group.
     """
     items_root = merged_bp / 'items'
     if not items_root.exists():
@@ -469,7 +469,7 @@ def _normalize_merged_creative_visibility(merged_bp: Path) -> None:
         file_stem = path.stem.lower()
         ident_lower = identifier.lower()
         if 'minecraft:wearable' in comps:
-            desc.pop('menu_category', None)
+            desc['menu_category'] = {'category': 'none'}
         elif any(token in ident_lower or token in file_stem for token in ('selector', 'ui', 'menu')):
             desc['menu_category'] = {'category': 'equipment'}
         _write_json(path, data)
