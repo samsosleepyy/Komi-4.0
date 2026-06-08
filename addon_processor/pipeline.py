@@ -25,6 +25,28 @@ SLOT_BY_WEARABLE = {
     "slot.armor.feet": "feet",
 }
 
+SLOT_KEYS = [slot[0] for slot in SLOTS]
+SLOTS_BY_KEY = {slot[0]: slot for slot in SLOTS}
+
+
+def _slot_keys_for_candidate(candidate: "AddonItemCandidate", slot_mode: str = "all", custom_slots: Optional[List[str]] = None) -> List[str]:
+    """Return the output wearable slots for one selected source item.
+
+    original: keep only the source item's original wearable slot.
+    all: create all four wearable variants.
+    custom: create only the user-selected slots.
+    """
+    mode = (slot_mode or "all").lower()
+    if mode == "original":
+        return [SLOT_BY_WEARABLE.get(candidate.wearable_slot, "legs")]
+    if mode == "custom":
+        slots = [s for s in (custom_slots or []) if s in SLOT_KEYS]
+        if not slots:
+            raise AddonError("ยังไม่ได้เลือกช่องที่จะให้ไอเท็มใส่ได้")
+        return list(dict.fromkeys(slots))
+    return list(SLOT_KEYS)
+
+
 TEXTURE_EXTS = (".png", ".tga", ".jpg", ".jpeg", ".webp")
 BUILTIN_GEOMETRY_PREFIXES = ("geometry.humanoid", "geometry.player")
 BUILTIN_RENDER_PREFIXES = ("controller.render.armor", "controller.render.item")
@@ -547,166 +569,186 @@ def _generate_ui_script(selector_id: str, armors: List[Dict[str, Any]], all_item
         "armors": armors,
         "allItems": all_item_ids,
     }, ensure_ascii=False, indent=2)
-    return f'''import {{ world, system, EquipmentSlot, ItemStack }} from "@minecraft/server";
-import {{ ActionFormData, MessageFormData }} from "@minecraft/server-ui";
+    script = r"""import { world, system, EquipmentSlot, ItemStack } from "@minecraft/server";
+import { ActionFormData, MessageFormData } from "@minecraft/server-ui";
 
-const CONFIG = {data};
+const CONFIG = __CONFIG_JSON__;
 const SLOTS = [
-  {{ key: "head", label: "หัว", commandSlot: "slot.armor.head", equipmentSlot: EquipmentSlot.Head }},
-  {{ key: "chest", label: "ตัว", commandSlot: "slot.armor.chest", equipmentSlot: EquipmentSlot.Chest }},
-  {{ key: "legs", label: "กางเกง", commandSlot: "slot.armor.legs", equipmentSlot: EquipmentSlot.Legs }},
-  {{ key: "feet", label: "รองเท้า", commandSlot: "slot.armor.feet", equipmentSlot: EquipmentSlot.Feet }},
+  { key: "head", label: "หัว", commandSlot: "slot.armor.head", equipmentSlot: EquipmentSlot.Head },
+  { key: "chest", label: "ตัว", commandSlot: "slot.armor.chest", equipmentSlot: EquipmentSlot.Chest },
+  { key: "legs", label: "กางเกง", commandSlot: "slot.armor.legs", equipmentSlot: EquipmentSlot.Legs },
+  { key: "feet", label: "รองเท้า", commandSlot: "slot.armor.feet", equipmentSlot: EquipmentSlot.Feet },
 ];
+const SLOT_BY_KEY = new Map(SLOTS.map((slot) => [slot.key, slot]));
 const ALL_ADDON_ARMOR_ITEMS = new Set(CONFIG.allItems);
 
-function getEquippedItem(player, slot) {{
-  try {{
+function getAvailableSlots(armor) {
+  const keys = Object.keys(armor.items || {}).filter((key) => armor.items[key] && SLOT_BY_KEY.has(key));
+  return keys.map((key) => SLOT_BY_KEY.get(key));
+}
+
+function getEquippedItem(player, slot) {
+  try {
     const equipment = player.getComponent("minecraft:equippable");
     if (!equipment) return undefined;
     return equipment.getEquipment(slot.equipmentSlot);
-  }} catch (error) {{
+  } catch (error) {
     return undefined;
-  }}
-}}
+  }
+}
 
-function isAddonArmor(item) {{
+function isAddonArmor(item) {
   return !!item && ALL_ADDON_ARMOR_ITEMS.has(item.typeId);
-}}
+}
 
-function getItemLabel(item) {{
+function getItemLabel(item) {
   if (!item || item.typeId === "minecraft:air") return "";
   if (item.nameTag) return item.nameTag;
   return item.typeId;
-}}
+}
 
-async function runPlayerCommand(player, command) {{
-  try {{
+async function runPlayerCommand(player, command) {
+  try {
     if (typeof player.runCommandAsync === "function") await player.runCommandAsync(command);
     else player.runCommand(command);
     return true;
-  }} catch (error) {{
+  } catch (error) {
     return false;
-  }}
-}}
+  }
+}
 
-function getEquippable(player) {{
-  try {{
+function getEquippable(player) {
+  try {
     return player.getComponent("minecraft:equippable");
-  }} catch (error) {{
+  } catch (error) {
     return undefined;
-  }}
-}}
+  }
+}
 
-function purgeFromInventory(player, itemId) {{
-  try {{
+function purgeFromInventory(player, itemId) {
+  try {
     const inventory = player.getComponent("minecraft:inventory");
     const container = inventory && inventory.container;
     if (!container) return;
-    for (let i = 0; i < container.size; i++) {{
+    for (let i = 0; i < container.size; i++) {
       const item = container.getItem(i);
       if (item && item.typeId === itemId) container.setItem(i, undefined);
-    }}
-  }} catch (error) {{}}
-}}
+    }
+  } catch (error) {}
+}
 
-async function clearArmorSlot(player, slot) {{
-  // Eldoria-style path: hidden category:none wearable items should be handled
-  // through the equippable component first. The replaceitem command can reject
-  // hidden/custom wearables on some Bedrock versions.
-  try {{
+async function clearArmorSlot(player, slot) {
+  try {
     const equipment = getEquippable(player);
-    if (equipment) {{
+    if (equipment) {
       equipment.setEquipment(slot.equipmentSlot, undefined);
       return true;
-    }}
-  }} catch (error) {{}}
-  const ok = await runPlayerCommand(player, `replaceitem entity @s ${{slot.commandSlot}} 0 minecraft:air 1 0`);
+    }
+  } catch (error) {}
+  const ok = await runPlayerCommand(player, `replaceitem entity @s ${slot.commandSlot} 0 minecraft:air 1 0`);
   return ok;
-}}
+}
 
-async function clearAllAddonArmorFromOtherSlots(player, targetSlot) {{
-  for (const slot of SLOTS) {{
+async function clearAllAddonArmorFromOtherSlots(player, targetSlot) {
+  for (const slot of SLOTS) {
     if (slot.key === targetSlot.key) continue;
     const existing = getEquippedItem(player, slot);
     if (isAddonArmor(existing)) await clearArmorSlot(player, slot);
-  }}
-}}
+  }
+}
 
-async function replaceArmor(player, slot, itemId) {{
-  // Same method used by Eldoria: create an ItemStack and place it directly into
-  // the requested armor slot. This keeps category:none items hidden from Creative
-  // while still allowing them to be equipped by the UI system.
-  try {{
+async function replaceArmor(player, slot, itemId) {
+  try {
     const equipment = getEquippable(player);
-    if (equipment) {{
+    if (equipment) {
       purgeFromInventory(player, itemId);
       equipment.setEquipment(slot.equipmentSlot, new ItemStack(itemId, 1));
-      try {{ await system.waitTicks(1); }} catch (error) {{}}
+      try { await system.waitTicks(1); } catch (error) {}
       const equipped = getEquippedItem(player, slot);
-      if (equipped && equipped.typeId === itemId) {{
+      if (equipped && equipped.typeId === itemId) {
         purgeFromInventory(player, itemId);
         return true;
-      }}
-    }}
-  }} catch (error) {{}}
-  return await runPlayerCommand(player, `replaceitem entity @s ${{slot.commandSlot}} 0 ${{itemId}} 1 0`);
-}}
+      }
+    }
+  } catch (error) {}
+  return await runPlayerCommand(player, `replaceitem entity @s ${slot.commandSlot} 0 ${itemId} 1 0`);
+}
 
-async function showArmorMenu(player) {{
+async function showArmorMenu(player) {
   const form = new ActionFormData()
     .title(CONFIG.uiTitle || "รวมไอเท็มใส่ UI")
-    .body("§eเลือกไอเท็มที่ต้องการใส่\\n\\n§b§lAuto convert skin ui§r §7by §eSamSoSleepy\\n§9Discord : §ahttps://discord.gg/FnmWw7nWyq");
+    .body("§eเลือกไอเท็มที่ต้องการใส่\n\n§b§lAuto convert skin ui§r §7by §eSamSoSleepy\n§9Discord : §ahttps://discord.gg/FnmWw7nWyq");
   for (const armor of CONFIG.armors) form.button(armor.name, armor.icon || undefined);
   const response = await form.show(player);
   if (response.canceled || response.selection === undefined) return;
-  await showSlotMenu(player, CONFIG.armors[response.selection]);
-}}
+  const armor = CONFIG.armors[response.selection];
+  const availableSlots = getAvailableSlots(armor);
+  if (availableSlots.length === 1) {
+    await equipArmorToSlot(player, armor, availableSlots[0]);
+    return;
+  }
+  await showSlotMenu(player, armor, availableSlots);
+}
 
-async function showSlotMenu(player, armor) {{
+async function showSlotMenu(player, armor, availableSlots) {
+  const slots = availableSlots && availableSlots.length ? availableSlots : getAvailableSlots(armor);
+  if (slots.length === 1) {
+    await equipArmorToSlot(player, armor, slots[0]);
+    return;
+  }
   const form = new ActionFormData().title(armor.name).body("เลือกช่องที่จะใส่");
-  for (const slot of SLOTS) form.button(slot.label);
+  for (const slot of slots) form.button(slot.label);
   const response = await form.show(player);
   if (response.canceled || response.selection === undefined) return;
-  const slot = SLOTS[response.selection];
+  const slot = slots[response.selection];
+  await equipArmorToSlot(player, armor, slot);
+}
+
+async function equipArmorToSlot(player, armor, slot) {
   const itemId = armor.items[slot.key];
+  if (!itemId) {
+    player.sendMessage("§cไอเท็มนี้ไม่ได้เปิดให้ใส่ช่องนี้");
+    return;
+  }
   const existing = getEquippedItem(player, slot);
-  if (existing && existing.typeId !== "minecraft:air") {{
+  if (existing && existing.typeId !== "minecraft:air") {
     await showOverwriteMenu(player, armor, slot, existing, itemId);
     return;
-  }}
+  }
   await clearAllAddonArmorFromOtherSlots(player, slot);
   const ok = await replaceArmor(player, slot, itemId);
-  player.sendMessage(ok ? `§aใส่ ${{armor.name}} ที่ช่อง${{slot.label}}แล้ว` : "§cใส่ไอเท็มไม่สำเร็จ");
-}}
+  player.sendMessage(ok ? `§aใส่ ${armor.name} ที่ช่อง${slot.label}แล้ว` : "§cใส่ไอเท็มไม่สำเร็จ");
+}
 
-async function showOverwriteMenu(player, armor, slot, existing, itemId) {{
+async function showOverwriteMenu(player, armor, slot, existing, itemId) {
   const existingName = getItemLabel(existing);
   const note = isAddonArmor(existing)
     ? "ไอเท็มนี้มาจาก addon นี้"
     : "ไอเท็มนี้ไม่ใช่ addon นี้ แต่จะหายไปถ้าทับ";
   const form = new MessageFormData()
     .title("ช่องนี้มีไอเท็มอยู่แล้ว")
-    .body(`ช่อง${{slot.label}}มี ${{existingName}} อยู่แล้ว\n${{note}}\n\nต้องการทับเลยไหม?\n§cไอเท็มที่ถูกทับจะหายไป`)
+    .body(`ช่อง${slot.label}มี ${existingName} อยู่แล้ว\n${note}\n\nต้องการทับเลยไหม?\n§cไอเท็มที่ถูกทับจะหายไป`)
     .button1("ทับเลย")
     .button2("ยกเลิก");
   const response = await form.show(player);
   if (response.canceled || response.selection !== 0) return;
   await clearAllAddonArmorFromOtherSlots(player, slot);
   const ok = await replaceArmor(player, slot, itemId);
-  player.sendMessage(ok ? `§aทับไอเท็มเดิมและใส่ ${{armor.name}} ที่ช่อง${{slot.label}}แล้ว` : "§cใส่ไอเท็มไม่สำเร็จ");
-}}
+  player.sendMessage(ok ? `§aทับไอเท็มเดิมและใส่ ${armor.name} ที่ช่อง${slot.label}แล้ว` : "§cใส่ไอเท็มไม่สำเร็จ");
+}
 
-world.afterEvents.itemUse.subscribe((event) => {{
+world.afterEvents.itemUse.subscribe((event) => {
   const player = event.source;
   const item = event.itemStack;
   if (!player || !item || item.typeId !== CONFIG.menuItem) return;
-  system.run(() => {{
-    showArmorMenu(player).catch(() => {{
-      try {{ player.sendMessage("§cไม่สามารถเปิด UI ได้ ลองกดใช้อีกครั้ง"); }} catch (error) {{}}
-    }});
-  }});
-}});
-'''
+  system.run(() => {
+    showArmorMenu(player).catch(() => {
+      try { player.sendMessage("§cไม่สามารถเปิด UI ได้ ลองกดใช้อีกครั้ง"); } catch (error) {}
+    });
+  });
+});
+"""
+    return script.replace("__CONFIG_JSON__", data)
 
 
 def _lang_label(display_name: str, slot_key: str) -> str:
@@ -764,7 +806,7 @@ def _normalize_creative_visibility(items_root: Path, selector_id: str) -> None:
         _write_json(item_path, data)
 
 
-def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: str) -> str:
+def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: str, slot_mode: str = "all", custom_slots: Optional[List[str]] = None) -> str:
     """Normalize/Rebuild Mode.
 
     Instead of patching the uploaded addon in-place, this extracts only wearable item
@@ -840,7 +882,11 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
             "icon": icon_ref,
             "items": {},
         }
-        for slot_key, slot_label, wearable_slot, _slot_enum, _slot_layer in SLOTS:
+        output_slot_keys = _slot_keys_for_candidate(candidate, slot_mode, custom_slots)
+        if slot_mode == "original" and candidate.wearable_slot not in SLOT_BY_WEARABLE:
+            warnings.append(f"ไม่รู้จัก wearable slot เดิมของ {candidate.identifier}: {candidate.wearable_slot}; fallback เป็นกางเกง")
+        for slot_key in output_slot_keys:
+            slot_label, wearable_slot = SLOTS_BY_KEY[slot_key][1], SLOTS_BY_KEY[slot_key][2]
             new_item_name = f"{base}_{slot_key}"
             new_item_id = f"{new_ns}:{new_item_name}"
             all_item_ids.append(new_item_id)
@@ -890,6 +936,8 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
         f"Source: {src.name}",
         f"Addon name: {addon_name}",
         f"Selected items: {len(selected)}",
+        f"Slot mode: {slot_mode}",
+        f"Custom slots: {", ".join(custom_slots or []) if custom_slots else "-"}",
         "",
         "Converted identifiers:",
     ]
