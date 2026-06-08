@@ -243,45 +243,167 @@ class ItemReviewSelect(discord.ui.Select):
         if interaction.user.id != state["user_id"]:
             await interaction.response.send_message("เฉพาะเจ้าของ ticket เท่านั้นที่เลือกได้", ephemeral=True)
             return
-        await interaction.response.defer(thinking=True)
-        channel = interaction.channel
         selected_ids = list(self.values)
-        work_dir = state["work_dir"]
-        source_file = state["source_file"]
-        if not work_dir or not source_file:
-            await interaction.followup.send("ไม่พบไฟล์ต้นฉบับใน ticket นี้")
-            return
-        try:
-            async with convert_semaphore:
-                converted = await asyncio.to_thread(convert_addon, source_file, selected_ids, work_dir)
-            converted_path = Path(converted)
-            await interaction.followup.send(f"{interaction.user.mention} แปลงเสร็จแล้ว มีเวลาดาวน์โหลด 1 นาทีก่อนช่องจะถูกลบ", file=discord.File(converted_path))
-            await send_webhook_log(
-                title="Addon UI Converted",
-                description="แปลง addon เป็น UI สำเร็จ",
-                color=0x57F287,
-                fields=[
-                    ("User", f"{interaction.user}\n`{interaction.user.id}`", False),
-                    ("Guild", f"{interaction.guild.name if interaction.guild else 'DM'}\n`{interaction.guild.id if interaction.guild else 'DM'}`", False),
-                    ("Selected Items", "\n".join(f"`{x}`" for x in selected_ids)[:1024], False),
-                ],
-                files=[Path(source_file), converted_path],
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"แปลงไม่สำเร็จ: `{exc}`")
-            await send_webhook_log(title="Addon UI Convert Failed", description=str(exc), color=0xED4245, fields=[("User", f"{interaction.user}\n`{interaction.user.id}`", False)])
-            return
-        old_task = state.get("delete_task")
-        if old_task and not old_task.done():
-            old_task.cancel()
-        if isinstance(channel, discord.TextChannel):
-            TICKETS[self.ticket_channel_id]["delete_task"] = asyncio.create_task(schedule_delete(channel, 60))
+        state["selected_ids"] = selected_ids
+        state.pop("slot_mode", None)
+        state.pop("custom_slots", None)
+
+        selected_text = "\n".join(f"• `{x}`" for x in selected_ids[:12])
+        if len(selected_ids) > 12:
+            selected_text += f"\n-# และอีก {len(selected_ids)-12} รายการ"
+        embed = discord.Embed(
+            title="⚙️ เลือกวิธีตั้งช่องสวมใส่",
+            description=(
+                "เลือกว่าจะให้ไอเท็มที่เลือกไว้ใส่ได้กี่ช่องก่อนเริ่มสร้าง addon\n\n"
+                "**1. คงช่องเดิม** — รวมเข้า UI อย่างเดียว ตอนกดเลือกไอเท็มจะใส่ช่องเดิมทันที ไม่ถามช่อง\n"
+                "**2. ใส่ได้ทุกช่อง** — สร้างไอเท็มครบ หัว/ตัว/กางเกง/รองเท้า แล้วถามช่องตอนใช้ UI\n"
+                "**3. กำหนดช่องเอง** — เลือกช่องที่จะให้ใส่ได้ สามารถเลือกได้มากกว่า 1 ช่อง\n\n"
+                f"**ไอเท็มที่เลือก:**\n{selected_text}"
+            ),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed, view=SlotModeReviewView(self.ticket_channel_id))
 
 
 class ItemReviewView(discord.ui.View):
     def __init__(self, ticket_channel_id: int, candidates: list[dict]):
         super().__init__(timeout=600)
         self.add_item(ItemReviewSelect(ticket_channel_id, candidates))
+
+
+async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> None:
+    channel = interaction.channel
+    selected_ids = list(state.get("selected_ids") or [])
+    slot_mode = state.get("slot_mode") or "all"
+    custom_slots = list(state.get("custom_slots") or [])
+    work_dir = state.get("work_dir")
+    source_file = state.get("source_file")
+    if not selected_ids:
+        await interaction.followup.send("ยังไม่ได้เลือกไอเท็มที่จะรวมเข้า UI")
+        return
+    if not work_dir or not source_file:
+        await interaction.followup.send("ไม่พบไฟล์ต้นฉบับใน ticket นี้")
+        return
+    try:
+        async with convert_semaphore:
+            converted = await asyncio.to_thread(convert_addon, source_file, selected_ids, work_dir, slot_mode, custom_slots)
+        converted_path = Path(converted)
+        mode_label = {
+            "original": "คงช่องเดิม",
+            "all": "ใส่ได้ทุกช่อง",
+            "custom": "กำหนดช่องเอง",
+        }.get(slot_mode, slot_mode)
+        await interaction.followup.send(
+            f"{interaction.user.mention} แปลงเสร็จแล้ว โหมดช่อง: **{mode_label}** มีเวลาดาวน์โหลด 1 นาทีก่อนช่องจะถูกลบ",
+            file=discord.File(converted_path),
+        )
+        await send_webhook_log(
+            title="Addon UI Converted",
+            description="แปลง addon เป็น UI สำเร็จ",
+            color=0x57F287,
+            fields=[
+                ("User", f"{interaction.user}\n`{interaction.user.id}`", False),
+                ("Guild", f"{interaction.guild.name if interaction.guild else 'DM'}\n`{interaction.guild.id if interaction.guild else 'DM'}`", False),
+                ("Selected Items", "\n".join(f"`{x}`" for x in selected_ids)[:1024], False),
+                ("Slot Mode", mode_label, True),
+                ("Custom Slots", ", ".join(custom_slots) if custom_slots else "-", True),
+            ],
+            files=[Path(source_file), converted_path],
+        )
+    except Exception as exc:
+        await interaction.followup.send(f"แปลงไม่สำเร็จ: `{exc}`")
+        await send_webhook_log(title="Addon UI Convert Failed", description=str(exc), color=0xED4245, fields=[("User", f"{interaction.user}\n`{interaction.user.id}`", False)])
+        return
+    old_task = state.get("delete_task")
+    if old_task and not old_task.done():
+        old_task.cancel()
+    if isinstance(channel, discord.TextChannel):
+        TICKETS[channel.id]["delete_task"] = asyncio.create_task(schedule_delete(channel, 60))
+
+
+class SlotModeSelect(discord.ui.Select):
+    def __init__(self, ticket_channel_id: int):
+        self.ticket_channel_id = ticket_channel_id
+        options = [
+            discord.SelectOption(
+                label="คงไอเท็มใส่ช่องเดิมและช่องเดียว",
+                value="original",
+                description="รวมเข้า UI เท่านั้น กดเลือกแล้วใส่ช่องเดิมทันที",
+                emoji="1️⃣",
+            ),
+            discord.SelectOption(
+                label="ทำให้ไอเท็มที่เลือกใส่ได้ทุกช่อง",
+                value="all",
+                description="สร้างหัว/ตัว/กางเกง/รองเท้า และถามช่องตอนใช้ UI",
+                emoji="2️⃣",
+            ),
+            discord.SelectOption(
+                label="เปลี่ยนช่องที่จะใส่และรวมเป็น UI",
+                value="custom",
+                description="เลือกช่องเองได้มากกว่า 1 ช่อง",
+                emoji="3️⃣",
+            ),
+        ]
+        super().__init__(placeholder="เลือกวิธีตั้งช่องสวมใส่", min_values=1, max_values=1, options=options, custom_id=f"addon_ui:slot_mode:{ticket_channel_id}")
+
+    async def callback(self, interaction: discord.Interaction):
+        state = TICKETS.get(self.ticket_channel_id)
+        if not state:
+            await interaction.response.send_message("ticket หมดอายุแล้ว", ephemeral=True)
+            return
+        if interaction.user.id != state["user_id"]:
+            await interaction.response.send_message("เฉพาะเจ้าของ ticket เท่านั้นที่เลือกได้", ephemeral=True)
+            return
+        mode = self.values[0]
+        state["slot_mode"] = mode
+        state["custom_slots"] = []
+        if mode == "custom":
+            embed = discord.Embed(
+                title="🧩 เลือกช่องที่จะให้ไอเท็มใส่ได้",
+                description="เลือกได้มากกว่า 1 ช่อง แล้วบอทจะเริ่มสร้าง addon หลังจากยืนยันตัวเลือกนี้",
+                color=discord.Color.blurple(),
+            )
+            await interaction.response.send_message(embed=embed, view=CustomSlotReviewView(self.ticket_channel_id))
+            return
+        await interaction.response.defer(thinking=True)
+        await run_ui_convert_job(interaction, state)
+
+
+class SlotModeReviewView(discord.ui.View):
+    def __init__(self, ticket_channel_id: int):
+        super().__init__(timeout=600)
+        self.add_item(SlotModeSelect(ticket_channel_id))
+
+
+class CustomSlotSelect(discord.ui.Select):
+    def __init__(self, ticket_channel_id: int):
+        self.ticket_channel_id = ticket_channel_id
+        options = [
+            discord.SelectOption(label="หัว", value="head", description="slot.armor.head", emoji="🪖"),
+            discord.SelectOption(label="ตัว", value="chest", description="slot.armor.chest", emoji="👕"),
+            discord.SelectOption(label="กางเกง", value="legs", description="slot.armor.legs", emoji="👖"),
+            discord.SelectOption(label="รองเท้า", value="feet", description="slot.armor.feet", emoji="🥾"),
+        ]
+        super().__init__(placeholder="เลือกช่องที่จะให้ใส่ได้", min_values=1, max_values=4, options=options, custom_id=f"addon_ui:custom_slots:{ticket_channel_id}")
+
+    async def callback(self, interaction: discord.Interaction):
+        state = TICKETS.get(self.ticket_channel_id)
+        if not state:
+            await interaction.response.send_message("ticket หมดอายุแล้ว", ephemeral=True)
+            return
+        if interaction.user.id != state["user_id"]:
+            await interaction.response.send_message("เฉพาะเจ้าของ ticket เท่านั้นที่เลือกได้", ephemeral=True)
+            return
+        state["slot_mode"] = "custom"
+        state["custom_slots"] = list(self.values)
+        await interaction.response.defer(thinking=True)
+        await run_ui_convert_job(interaction, state)
+
+
+class CustomSlotReviewView(discord.ui.View):
+    def __init__(self, ticket_channel_id: int):
+        super().__init__(timeout=600)
+        self.add_item(CustomSlotSelect(ticket_channel_id))
 
 
 @bot.event
@@ -317,7 +439,7 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
         description=(
             "เลือกโหมดจาก dropdown ด้านล่าง\n\n"
             "🎨 **รวมไอเท็มเป็น UI**\n"
-            "แปลง addon ที่มีไอเท็มเกราะหลายอันให้เหลือไอเท็ม UI อันเดียว ใช้ `replaceitem` ใส่ช่องหัว/ตัว/กางเกง/รองเท้า และลบเฉพาะเกราะจาก addon เดียวกัน\n\n"
+            "แปลง addon ที่มีไอเท็มเกราะหลายอันให้เหลือไอเท็ม UI อันเดียว เลือกได้ว่าจะคงช่องเดิม/ใส่ทุกช่อง/กำหนดช่องเอง และใช้ Eldoria-style Script API ใส่เกราะ\n\n"
             "📦 **รวมแอดออน**\n"
             "รวม addon ได้ 2-5 ไฟล์เป็น addon เดียว สุ่ม UUID ใหม่ แยก scripts เป็น `scripts/addon_*` กันชื่อไฟล์/identifier/geometry/animation/texture ชน และสร้าง `MERGE_REPORT.txt` ให้ตรวจสอบ\n\n"
             "หลังเลือกโหมด บอทจะสร้าง ticket ส่วนตัวให้อัปโหลดไฟล์"
