@@ -135,3 +135,14 @@ python bot.py
 ## หมายเหตุเรื่องความเสถียร
 
 Normalize/Rebuild Mode ลดปัญหา addon โครงสร้างแปลก เพราะไม่แก้ pack เดิมตรง ๆ แต่สร้าง pack ใหม่ตามทรงมาตรฐาน Seraphim อย่างไรก็ตาม addon ที่พึ่ง script เดิมเพื่อคุม animation variable แบบ dynamic อาจต้องทดสอบในเกมและตรวจ `NORMALIZE_REPORT.txt`
+
+## Creative inventory visibility update
+
+- UI selector items are shown in the top-level `Equipment` category with no armor sub-group.
+- Generated/copied wearable armor items have no `menu_category`, so they do not appear in Creative tabs and are intended for `/give` or `replaceitem` only.
+
+## Animation loop smoothing fix
+This build normalizes copied animations in Normalize/Rebuild mode:
+- Only the actually referenced animation id is written to each generated animation file.
+- Extra original animation ids from the source file are removed to avoid Bedrock registry collisions.
+- For looped animations where `animation_length` is only ~1 frame longer than the final keyframe, the length is clamped to the last real keyframe to remove visible loop stutter.
