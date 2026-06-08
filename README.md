@@ -149,3 +149,10 @@ Wearable/generated armor items now use:
 ```
 
 This matches creator-tool output that hides items from every Creative category while keeping them usable by `/give` and `replaceitem`. The UI selector item remains visible under the top-level Equipment category.
+
+### Eldoria-style hidden item equip fix
+
+Hidden wearable items use `menu_category: { "category": "none" }` like Eldoria.
+The generated UI now equips those hidden items through the Script API first:
+`equippable.setEquipment(slot, new ItemStack(itemId, 1))`, then falls back to `/replaceitem` only if the API path fails.
+This avoids the Bedrock issue where hidden custom wearables can remain give-able but fail when inserted by command.
