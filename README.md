@@ -1,29 +1,76 @@
 # Addon UI Discord Bot
 
-บอท Discord สำหรับแปลง Minecraft Bedrock addon ที่มีไอเท็มเกราะหลายชิ้น ให้รวมเป็นระบบ UI อัตโนมัติ
+บอท Discord สำหรับแปลง Minecraft Bedrock addon และรวม addon โดยเตรียมไว้สำหรับรันบน Render
 
-## ฟีเจอร์
+## ฟีเจอร์หลัก
 
 - จำกัดให้บอททำงานเฉพาะ server ID ที่กำหนดใน `ALLOWED_GUILDS`
-- ถ้าบอทอยู่ server นอก allowlist จะรายงานไป webhook และออกทันที
-- คำสั่ง `/setup` ใช้ได้เฉพาะ Administrator
-- สร้าง panel embed พร้อมปุ่ม `เริ่มรวมแอดออน`
-- กดปุ่มแล้วสร้างห้องส่วนตัวแบบ ticket ชั่วคราว
-- ผู้ใช้อัปโหลด `.mcaddon` หรือ `.zip`
-- บอทตรวจหา item ที่เป็น armor จาก `minecraft:wearable`
-- Review mode ด้วย dropdown แบบเลือกหลายอัน
-- บอท copy item/attachable/geometry/animation/texture ตามช่องหัว/ตัว/กางเกง/รองเท้า
-- สร้างไอเท็มเปิด UI เพียงอันเดียว
-- script UI ใช้ `replaceitem`
-- ก่อนใส่ชิ้นใหม่ จะลบเกราะจาก addon เดียวกันออกจากช่องอื่นทั้งหมด
-- ถ้าช่องปลายทางมีไอเท็มอยู่แล้ว จะถามก่อนทับ
-- สุ่ม UUID ใหม่ให้ addon ก่อนส่งออก
-- ส่ง log และไฟล์ต้นฉบับ/ไฟล์แปลงแล้วไป webhook
+- ถ้าอยู่ server นอก allowlist จะรายงานไป webhook และออกทันที
+- `/setup` ใช้ได้เฉพาะ Administrator
+- Panel เป็น dropdown:
+  - 🎨 รวมไอเท็มเป็น UI
+  - 📦 รวมแอดออน
+- Ticket channel ส่วนตัวชั่วคราว
+- ส่ง log และไฟล์ไป webhook
 - ไม่มีระบบ point ตามที่ขอ
 
-## Environment Variables บน Render
+## รวมไอเท็มเป็น UI: Normalize/Rebuild Mode
 
-ตั้งค่าใน Render > Environment:
+เวอร์ชันนี้ใช้แนวคิดจากโครงสร้าง Seraphim template ที่แปลง UI ได้เสถียร ไม่ patch addon เดิมโดยตรง แต่จะ:
+
+1. แตก addon ต้นฉบับ
+2. ตรวจหา `BP/items/*.json` ที่มี `minecraft:wearable`
+3. ให้ผู้ใช้เลือก item ผ่าน Review dropdown
+4. ดึงเฉพาะ asset สำคัญ:
+   - item metadata
+   - attachable metadata
+   - geometry ที่ attachable อ้างถึง
+   - animations ที่ attachable อ้างถึง
+   - render controllers custom ถ้ามี
+   - texture skin/model
+   - icon texture จาก `item_texture.json`
+5. สร้าง addon ใหม่ทั้งหมดเป็นโครงสร้างมาตรฐาน:
+   - `BP_auto_ui`
+   - `RP_auto_ui`
+6. สร้าง item จริงซ้ำครบ 4 ช่อง:
+   - head
+   - chest
+   - legs
+   - feet
+7. ซ่อนไอเท็ม armor จริงทั้งหมดจาก Creative
+8. สร้างไอเท็ม UI อันเดียวที่มองเห็นใน Creative
+9. สร้าง `scripts/auto_ui_system.js` สำหรับ UI + `replaceitem`
+10. ก่อนใส่ชิ้นใหม่ จะลบเฉพาะเกราะจาก addon ที่สร้างใหม่นี้ออกจากช่องอื่นทั้งหมด
+11. ถ้าช่องปลายทางมีของอยู่ จะถามก่อนทับ
+
+ชื่อ item UI จะเป็น:
+
+```text
+<Addon Name> item ui
+```
+
+หน้า UI มีข้อความ branding:
+
+```text
+Auto convert skin ui by SamSoSleepy
+Discord : https://discord.gg/FnmWw7nWyq
+```
+
+ผลลัพธ์จะมี `NORMALIZE_REPORT.txt` แนบอยู่ใน addon เพื่อดู mapping/warning
+
+## รวมแอดออน 2 ไฟล์
+
+โหมดนี้ยังคงอยู่จากเวอร์ชันก่อน:
+
+- รับ addon 2 ไฟล์
+- รวมเป็น `BP_merged` และ `RP_merged`
+- สุ่ม UUID ใหม่
+- แยก scripts เดิมเป็น `scripts/addon_<prefix>/...`
+- สร้าง main.js ใหม่สำหรับ import script entry ของแต่ละ addon
+- prefix identifiers/geometry/animation/controller/texture เพื่อลดการชนกัน
+- สร้าง `MERGE_REPORT.txt`
+
+## Environment Variables บน Render
 
 ```env
 DISCORD_TOKEN=token ของบอท
@@ -32,7 +79,7 @@ ALLOWED_GUILDS=1420339720277463112,1441795602550882334
 MAX_PARALLEL_JOBS=1
 ```
 
-> หมายเหตุ: ถ้า webhook URL เคยถูกส่งในแชทหรือหลุดออกไปแล้ว ให้ลบ/rotate webhook เดิม และสร้างอันใหม่ทันที
+ถ้า webhook URL เคยหลุดหรือเคยส่งในแชท ให้ rotate webhook ก่อนใช้จริง
 
 ## Deploy บน Render
 
@@ -50,16 +97,16 @@ Start Command:
 python bot.py
 ```
 
-หรือใช้ `render.yaml` ในโปรเจกต์นี้ได้เลย
+โปรเจกต์ pin Python 3.12.8 เพื่อหลีกเลี่ยงปัญหา `audioop` กับ `discord.py`
 
 ## Discord Developer Portal
 
-เปิด intent ที่แนะนำ:
+เปิด intents ที่แนะนำ:
 
-- Server Members Intent เพื่ออ่าน owner/member count ได้เสถียรขึ้น
-- Message Content Intent เพื่อให้บอทอ่าน ticket message และ attachment ได้ชัวร์
+- Server Members Intent
+- Message Content Intent
 
-ให้สิทธิ์บอทใน server:
+สิทธิ์บอทที่ควรมี:
 
 - Manage Channels
 - Send Messages
@@ -67,59 +114,15 @@ python bot.py
 - Attach Files
 - Read Message History
 - Use Slash Commands
-- Create Instant Invite ไม่จำเป็น เพราะโปรเจกต์นี้ไม่สร้าง invite ใน server นอก allowlist เพื่อความปลอดภัย
 
 ## วิธีใช้
-
-ใช้คำสั่ง:
 
 ```text
 /setup category:<หมวดหมู่> channel:<ช่องที่จะส่ง panel> image_url:<ลิงก์รูป embed>
 ```
 
-หลังจากนั้นผู้ใช้กดปุ่ม `เริ่มรวมแอดออน` แล้วอัปโหลดไฟล์ addon ใน ticket channel
+หลังจากนั้นเลือกโหมดจาก dropdown แล้วอัปโหลดไฟล์ใน ticket channel
 
-## ความปลอดภัย
+## หมายเหตุเรื่องความเสถียร
 
-โปรเจกต์นี้จะไม่ก๊อปหรือสร้าง invite link จาก server ที่ไม่ได้รับอนุญาต เพราะเป็นข้อมูลทางเข้าของ server อื่น ระบบจะรายงานเฉพาะชื่อ server, id, owner, จำนวนสมาชิก แล้วออกทันที
-
-
-## Render Python version note
-
-This project pins Python to 3.12.8 using both `.python-version` and `PYTHON_VERSION` in `render.yaml`. New Render services may default to Python 3.14, where the old stdlib `audioop` module is removed. `requirements.txt` also includes `audioop-lts` for Python >= 3.13 as a fallback.
-
-## Render Web Service port note
-
-เวอร์ชันนี้มี health server เล็ก ๆ ที่ bind กับ `PORT` ของ Render อัตโนมัติ (`/` และ `/healthz`) ดังนั้นถ้า deploy เป็น Web Service จะไม่เจอปัญหา `No open ports detected` แล้ว
-
-อย่างไรก็ตาม สำหรับ Discord bot แนะนำใช้ Background Worker มากกว่า เพราะบอทไม่ได้ต้องรับ traffic HTTP จริง ๆ
-
-## Update notes
-
-- Original wearable addon items are hidden from Creative inventory after conversion.
-- Only the generated UI item is visible in Creative.
-- Generated UI item name is based on the addon pack name without BP/RP suffix: `<Addon Name> item ui`.
-- Armor selection UI includes the SamSoSleepy branding line.
-
-## Update: โหมดรวมแอดออน 2 ไฟล์
-
-เวอร์ชันนี้เพิ่ม dropdown ที่ panel แทนปุ่มเดี่ยว:
-
-- 🎨 รวมไอเท็มเป็น UI
-- 📦 รวมแอดออน
-
-### ระบบรวมแอดออนทำอะไรบ้าง
-
-- รับ addon 2 ไฟล์ใน ticket เดียว
-- แตก BP/RP ของทั้งสองไฟล์
-- รวมเป็น `BP_merged` และ `RP_merged`
-- สุ่ม UUID ใหม่ให้ manifest ทั้ง BP/RP
-- แยก script เดิมเป็น `scripts/addon_<prefix>/...`
-- สร้าง `scripts/main.js` ใหม่เพื่อ import script entry ของแต่ละ addon
-- prefix identifiers / geometry / animation / controller / texture keys / texture paths เพื่อลดไฟล์ชนกัน
-- merge `item_texture.json`, `texts/*.lang`, `languages.json`
-- แนบ `MERGE_REPORT.txt` ใน addon ที่ส่งออกเพื่อดูรายงานและ warning
-
-### ข้อจำกัดของโหมดรวมแอดออน
-
-ระบบกันชนแบบอัตโนมัติครอบคลุม resource/identifier ที่เจอบ่อยมากใน addon แบบ item/attachable/geometry/animation/texture แต่ถ้า addon มี script ที่สร้าง identifier แบบ dynamic เช่นเอา string มาต่อเองใน runtime บอทจะไม่สามารถรู้เจตนาได้ 100% ดังนั้นควรทดสอบในเกมหลังรวมทุกครั้ง
+Normalize/Rebuild Mode ลดปัญหา addon โครงสร้างแปลก เพราะไม่แก้ pack เดิมตรง ๆ แต่สร้าง pack ใหม่ตามทรงมาตรฐาน Seraphim อย่างไรก็ตาม addon ที่พึ่ง script เดิมเพื่อคุม animation variable แบบ dynamic อาจต้องทดสอบในเกมและตรวจ `NORMALIZE_REPORT.txt`
