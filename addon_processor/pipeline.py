@@ -11,10 +11,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from uuid import uuid4
 
 SLOTS = [
-    ("head", "หัว", "slot.armor.head", "Head"),
-    ("chest", "ตัว", "slot.armor.chest", "Chest"),
-    ("legs", "กางเกง", "slot.armor.legs", "Legs"),
-    ("feet", "รองเท้า", "slot.armor.feet", "Feet"),
+    ("head", "หัว", "slot.armor.head", "Head", "helmet"),
+    ("chest", "ตัว", "slot.armor.chest", "Chest", "chest"),
+    ("legs", "กางเกง", "slot.armor.legs", "Legs", "leg"),
+    ("feet", "รองเท้า", "slot.armor.feet", "Feet", "boot"),
 ]
 
 SLOT_BY_WEARABLE = {
@@ -24,6 +24,11 @@ SLOT_BY_WEARABLE = {
     "slot.armor.legs": "legs",
     "slot.armor.feet": "feet",
 }
+
+TEXTURE_EXTS = (".png", ".tga", ".jpg", ".jpeg", ".webp")
+BUILTIN_GEOMETRY_PREFIXES = ("geometry.humanoid", "geometry.player")
+BUILTIN_RENDER_PREFIXES = ("controller.render.armor", "controller.render.item")
+BUILTIN_TEXTURE_PREFIXES = ("textures/misc/", "textures/ui/")
 
 @dataclass
 class AddonItemCandidate:
@@ -44,12 +49,15 @@ class AddonInspection:
 class AddonError(Exception):
     pass
 
+
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8-sig"))
+
 
 def _write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
 
 def _safe_extract(zip_path: Path, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -65,6 +73,7 @@ def _safe_extract(zip_path: Path, out_dir: Path) -> None:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(info) as src, open(target, "wb") as dst:
                     shutil.copyfileobj(src, dst)
+
 
 def _find_packs(root: Path) -> Tuple[Path, Path]:
     bp: Optional[Path] = None
@@ -86,6 +95,7 @@ def _find_packs(root: Path) -> Tuple[Path, Path]:
         raise AddonError("ไม่พบ Resource Pack manifest ที่มี module type=resources")
     return bp, rp
 
+
 def _display_name_from_item(item_data: Dict[str, Any], fallback: str) -> str:
     comps = item_data.get("minecraft:item", {}).get("components", {})
     display = comps.get("minecraft:display_name")
@@ -94,6 +104,7 @@ def _display_name_from_item(item_data: Dict[str, Any], fallback: str) -> str:
     if isinstance(display, str):
         return display
     return fallback
+
 
 def _icon_from_item(item_data: Dict[str, Any]) -> str:
     comps = item_data.get("minecraft:item", {}).get("components", {})
@@ -105,6 +116,7 @@ def _icon_from_item(item_data: Dict[str, Any]) -> str:
             if isinstance(icon.get(key), str):
                 return icon[key]
     return ""
+
 
 def _scan_candidates(root: Path, bp: Path) -> List[AddonItemCandidate]:
     items_dir = bp / "items"
@@ -139,6 +151,7 @@ def _scan_candidates(root: Path, bp: Path) -> List[AddonItemCandidate]:
         ))
     return candidates
 
+
 def inspect_addon(addon_path: str, work_dir: str) -> AddonInspection:
     src = Path(addon_path)
     if not src.exists():
@@ -160,11 +173,13 @@ def inspect_addon(addon_path: str, work_dir: str) -> AddonInspection:
         candidates=candidates,
     )
 
+
 def _safe_id(value: str, default: str = "item") -> str:
-    value = value.lower().replace("-", "_")
+    value = str(value or "").lower().replace("-", "_")
     value = re.sub(r"[^a-z0-9_]+", "_", value).strip("_")
     value = re.sub(r"_+", "_", value)
     return value or default
+
 
 def _identifier_parts(identifier: str) -> Tuple[str, str]:
     if ":" in identifier:
@@ -175,7 +190,6 @@ def _identifier_parts(identifier: str) -> Tuple[str, str]:
 
 
 def _addon_base_name(bp: Path, rp: Path) -> str:
-    """Return pack display name without BP/RP suffix for selector item name."""
     for manifest_path in (bp / "manifest.json", rp / "manifest.json"):
         try:
             data = _read_json(manifest_path)
@@ -189,30 +203,12 @@ def _addon_base_name(bp: Path, rp: Path) -> str:
             return name
     return "Addon"
 
-def _hide_item_from_creative(item_data: Dict[str, Any]) -> bool:
-    """Hide an item from Creative inventory while keeping identifier usable by commands."""
-    changed = False
-    item = item_data.get("minecraft:item")
-    if not isinstance(item, dict):
-        return False
-    desc = item.get("description")
-    if isinstance(desc, dict):
-        for key in ("menu_category", "category"):
-            if key in desc:
-                desc.pop(key, None)
-                changed = True
-    comps = item.get("components")
-    if isinstance(comps, dict):
-        # Older/custom generated addons can still use this component to show items in Creative.
-        if "minecraft:creative_category" in comps:
-            comps.pop("minecraft:creative_category", None)
-            changed = True
-    return changed
 
-def _find_attachable_for_item(rp: Path, item_id: str) -> Optional[Path]:
+def _find_attachable_for_item(rp: Path, item_id: str, candidate_file: str = "") -> Optional[Path]:
     attach_dir = rp / "attachables"
     if not attach_dir.exists():
         return None
+    candidates: List[Path] = []
     for path in sorted(attach_dir.rglob("*.json")):
         try:
             data = _read_json(path)
@@ -224,7 +220,19 @@ def _find_attachable_for_item(rp: Path, item_id: str) -> Optional[Path]:
             return path
         if desc.get("identifier") == item_id:
             return path
+        candidates.append(path)
+    # Fallback: many generated skin packs use matching file stems but no description.item.
+    stem = Path(candidate_file).stem.lower()
+    if stem:
+        for path in candidates:
+            if path.stem.lower() == stem:
+                return path
+    item_short = item_id.split(":")[-1].lower()
+    for path in candidates:
+        if path.stem.lower() == item_short:
+            return path
     return None
+
 
 def _load_item_texture_data(rp: Path) -> Tuple[Path, Dict[str, Any]]:
     path = rp / "textures" / "item_texture.json"
@@ -233,8 +241,8 @@ def _load_item_texture_data(rp: Path) -> Tuple[Path, Dict[str, Any]]:
             return path, _read_json(path)
         except Exception:
             pass
-    data = {"resource_pack_name": "vanilla", "texture_name": "atlas.items", "texture_data": {}}
-    return path, data
+    return path, {"resource_pack_name": "auto_ui", "texture_name": "atlas.items", "texture_data": {}}
+
 
 def _textures_value_to_first_path(value: Any) -> Optional[str]:
     if isinstance(value, str):
@@ -247,18 +255,26 @@ def _textures_value_to_first_path(value: Any) -> Optional[str]:
                 return _textures_value_to_first_path(value[key])
     return None
 
-def _copy_texture_path(rp: Path, texture_ref: str, new_ref: str) -> str:
-    # texture_ref normally has no extension, e.g. textures/skin/foo
-    for ext in (".png", ".tga"):
-        src = rp / (texture_ref + ext)
+
+def _copy_texture_between(src_rp: Path, dst_rp: Path, texture_ref: str, new_ref: str, warnings: List[str]) -> str:
+    if not isinstance(texture_ref, str) or not texture_ref.startswith("textures/"):
+        return texture_ref
+    if texture_ref.startswith(BUILTIN_TEXTURE_PREFIXES):
+        return texture_ref
+    for ext in TEXTURE_EXTS:
+        src = src_rp / (texture_ref + ext)
         if src.exists():
-            dst = rp / (new_ref + ext)
+            dst = dst_rp / (new_ref + ext)
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             return new_ref
+    warnings.append(f"ไม่พบ texture file: {texture_ref}")
     return texture_ref
 
+
 def _find_geometry_file(rp: Path, geometry_id: str) -> Optional[Path]:
+    if geometry_id.startswith(BUILTIN_GEOMETRY_PREFIXES):
+        return None
     models = rp / "models"
     if not models.exists():
         return None
@@ -267,30 +283,33 @@ def _find_geometry_file(rp: Path, geometry_id: str) -> Optional[Path]:
             data = _read_json(path)
         except Exception:
             continue
-        geometries = data.get("minecraft:geometry")
-        if isinstance(geometries, list):
-            for geo in geometries:
-                desc = geo.get("description", {}) if isinstance(geo, dict) else {}
-                if desc.get("identifier") == geometry_id:
+        geos = data.get("minecraft:geometry")
+        if isinstance(geos, list):
+            for geo in geos:
+                if isinstance(geo, dict) and geo.get("description", {}).get("identifier") == geometry_id:
                     return path
     return None
 
-def _copy_geometry(rp: Path, old_id: str, safe_name: str, slot_key: str) -> str:
-    path = _find_geometry_file(rp, old_id)
+
+def _copy_geometry_normalized(src_rp: Path, dst_rp: Path, old_id: str, new_id: str, out_name: str, warnings: List[str]) -> str:
+    if not isinstance(old_id, str) or not old_id.startswith("geometry."):
+        return old_id
+    if old_id.startswith(BUILTIN_GEOMETRY_PREFIXES):
+        return old_id
+    path = _find_geometry_file(src_rp, old_id)
     if not path:
+        warnings.append(f"ไม่พบ geometry file สำหรับ {old_id}; preserve reference เดิม")
         return old_id
     data = _read_json(path)
-    new_id = f"geometry.{safe_name}_{slot_key}"
     geos = data.get("minecraft:geometry")
     if isinstance(geos, list):
         for geo in geos:
-            if isinstance(geo, dict):
-                desc = geo.get("description", {})
-                if desc.get("identifier") == old_id:
-                    desc["identifier"] = new_id
-    new_path = path.parent / f"geometry.{safe_name}_{slot_key}.json"
-    _write_json(new_path, data)
+            if isinstance(geo, dict) and geo.get("description", {}).get("identifier") == old_id:
+                geo.setdefault("description", {})["identifier"] = new_id
+    out = dst_rp / "models" / "entity" / f"geometry.{out_name}.json"
+    _write_json(out, data)
     return new_id
+
 
 def _find_animation_file(rp: Path, animation_id: str) -> Optional[Path]:
     anim_dir = rp / "animations"
@@ -306,124 +325,220 @@ def _find_animation_file(rp: Path, animation_id: str) -> Optional[Path]:
             return path
     return None
 
-def _copy_animation(rp: Path, old_id: str, safe_name: str, slot_key: str) -> str:
-    path = _find_animation_file(rp, old_id)
+
+def _copy_animation_normalized(src_rp: Path, dst_rp: Path, old_id: str, new_id: str, out_name: str, warnings: List[str]) -> str:
+    if not isinstance(old_id, str) or not old_id.startswith("animation."):
+        return old_id
+    path = _find_animation_file(src_rp, old_id)
     if not path:
+        warnings.append(f"ไม่พบ animation file สำหรับ {old_id}; preserve reference เดิม")
         return old_id
     data = _read_json(path)
     animations = data.get("animations")
-    if not isinstance(animations, dict) or old_id not in animations:
-        return old_id
-    suffix = old_id.split(".", 1)[0] if "." in old_id else "animation"
-    new_id = f"{suffix}.{safe_name}_{slot_key}"
-    animations[new_id] = animations.pop(old_id)
-    new_path = path.parent / f"{safe_name}_{slot_key}.animation.json"
-    _write_json(new_path, data)
+    if isinstance(animations, dict) and old_id in animations:
+        animations[new_id] = animations.pop(old_id)
+    out = dst_rp / "animations" / f"{out_name}.animation.json"
+    _write_json(out, data)
     return new_id
 
-def _patch_attachable_for_slot(rp: Path, src_attach: Optional[Path], original_id: str, new_id: str, safe_name: str, slot_key: str) -> Optional[Path]:
-    if not src_attach or not src_attach.exists():
+
+def _find_render_controller_file(rp: Path, controller_id: str) -> Optional[Path]:
+    if controller_id.startswith(BUILTIN_RENDER_PREFIXES):
         return None
+    rc_dir = rp / "render_controllers"
+    if not rc_dir.exists():
+        return None
+    for path in sorted(rc_dir.rglob("*.json")):
+        try:
+            data = _read_json(path)
+        except Exception:
+            continue
+        controllers = data.get("render_controllers")
+        if isinstance(controllers, dict) and controller_id in controllers:
+            return path
+    return None
+
+
+def _copy_render_controller_normalized(src_rp: Path, dst_rp: Path, old_id: str, new_id: str, out_name: str, warnings: List[str]) -> str:
+    if not isinstance(old_id, str) or not old_id.startswith("controller.render."):
+        return old_id
+    if old_id.startswith(BUILTIN_RENDER_PREFIXES):
+        return old_id
+    path = _find_render_controller_file(src_rp, old_id)
+    if not path:
+        warnings.append(f"ไม่พบ render controller file สำหรับ {old_id}; preserve reference เดิม")
+        return old_id
+    data = _read_json(path)
+    controllers = data.get("render_controllers")
+    if isinstance(controllers, dict) and old_id in controllers:
+        controllers[new_id] = controllers.pop(old_id)
+    out = dst_rp / "render_controllers" / f"{out_name}.render_controllers.json"
+    _write_json(out, data)
+    return new_id
+
+
+def _slot_parent_setup(slot_key: str) -> str:
+    return {
+        "head": "variable.helmet_layer_visible = 0.0;",
+        "chest": "variable.chest_layer_visible = 0.0;",
+        "legs": "variable.leg_layer_visible = 0.0;",
+        "feet": "variable.boot_layer_visible = 0.0;",
+    }.get(slot_key, "variable.leg_layer_visible = 0.0;")
+
+
+def _retarget_parent_setup(desc: Dict[str, Any], slot_key: str) -> None:
+    scripts = desc.setdefault("scripts", {})
+    if not isinstance(scripts, dict):
+        desc["scripts"] = {"parent_setup": _slot_parent_setup(slot_key)}
+        return
+    parent_setup = scripts.get("parent_setup")
+    layer_vars = (
+        "variable.helmet_layer_visible",
+        "variable.chest_layer_visible",
+        "variable.leg_layer_visible",
+        "variable.boot_layer_visible",
+    )
+    if not isinstance(parent_setup, str) or any(v in parent_setup for v in layer_vars):
+        scripts["parent_setup"] = _slot_parent_setup(slot_key)
+
+
+def _extract_attachable_desc(src_attach: Optional[Path]) -> Dict[str, Any]:
+    if not src_attach or not src_attach.exists():
+        return {
+            "materials": {"default": "armor"},
+            "textures": {},
+            "geometry": {"default": "geometry.humanoid.customSlim"},
+            "render_controllers": ["controller.render.armor"],
+        }
     data = _read_json(src_attach)
     desc = data.get("minecraft:attachable", {}).get("description", {})
-    desc["identifier"] = new_id
-    desc["item"] = {new_id: "query.owner_identifier=='minecraft:player'"}
+    return json.loads(json.dumps(desc)) if isinstance(desc, dict) else {}
+
+
+def _normalize_attachable_for_slot(src_rp: Path, dst_rp: Path, src_attach: Optional[Path], new_item_id: str, base: str, slot_key: str, warnings: List[str]) -> None:
+    desc = _extract_attachable_desc(src_attach)
+    desc["identifier"] = new_item_id
+    desc["item"] = {new_item_id: "query.owner_identifier=='minecraft:player'"}
+    _retarget_parent_setup(desc, slot_key)
+    desc.setdefault("materials", {"default": "armor"})
+    desc.setdefault("render_controllers", ["controller.render.armor"])
 
     textures = desc.get("textures")
     if isinstance(textures, dict):
         for key, value in list(textures.items()):
             if isinstance(value, str) and value.startswith("textures/") and "enchanted" not in value:
-                new_ref = f"textures/skin/{safe_name}_{slot_key}"
-                textures[key] = _copy_texture_path(rp, value, new_ref)
+                textures[key] = _copy_texture_between(src_rp, dst_rp, value, f"textures/models/armor/{base}_{slot_key}_{_safe_id(key, 'tex')}", warnings)
+    else:
+        desc["textures"] = {}
 
     geometries = desc.get("geometry")
     if isinstance(geometries, dict):
         for key, value in list(geometries.items()):
             if isinstance(value, str) and value.startswith("geometry."):
-                geometries[key] = _copy_geometry(rp, value, safe_name, slot_key)
+                new_geo_id = f"geometry.{base}_{slot_key}_{_safe_id(key, 'geo')}"
+                geometries[key] = _copy_geometry_normalized(src_rp, dst_rp, value, new_geo_id, f"{base}_{slot_key}_{_safe_id(key, 'geo')}", warnings)
+    else:
+        desc["geometry"] = {"default": "geometry.humanoid.customSlim"}
 
     animations = desc.get("animations")
     if isinstance(animations, dict):
         for key, value in list(animations.items()):
             if isinstance(value, str) and value.startswith("animation."):
-                animations[key] = _copy_animation(rp, value, safe_name, slot_key)
+                new_anim_id = f"animation.{base}_{slot_key}_{_safe_id(key, 'anim')}"
+                animations[key] = _copy_animation_normalized(src_rp, dst_rp, value, new_anim_id, f"{base}_{slot_key}_{_safe_id(key, 'anim')}", warnings)
 
-    out = src_attach.parent / f"{safe_name}_{slot_key}.json"
-    _write_json(out, data)
-    return out
+    render_controllers = desc.get("render_controllers")
+    if isinstance(render_controllers, list):
+        new_rcs = []
+        for i, value in enumerate(render_controllers):
+            if isinstance(value, str) and value.startswith("controller.render."):
+                new_rc_id = f"controller.render.{base}_{slot_key}_{i}"
+                new_rcs.append(_copy_render_controller_normalized(src_rp, dst_rp, value, new_rc_id, f"{base}_{slot_key}_{i}", warnings))
+            else:
+                new_rcs.append(value)
+        desc["render_controllers"] = new_rcs
 
-def _patch_item_texture(rp: Path, original_icon: str, new_icon: str, safe_name: str, slot_key: str) -> None:
-    path, data = _load_item_texture_data(rp)
-    tex_data = data.setdefault("texture_data", {})
-    original = tex_data.get(original_icon)
-    if original is None:
-        tex_data[new_icon] = {"textures": f"textures/item/{safe_name}_{slot_key}"}
-        _write_json(path, data)
-        return
-    copied = json.loads(json.dumps(original))
-    texture_ref = _textures_value_to_first_path(copied)
+    attachable = {
+        "format_version": "1.10.0",
+        "minecraft:attachable": {
+            "description": desc
+        }
+    }
+    _write_json(dst_rp / "attachables" / f"{base}_{slot_key}.json", attachable)
+
+
+def _item_texture_lookup(src_rp: Path, icon_key: str) -> Optional[str]:
+    _, data = _load_item_texture_data(src_rp)
+    tex = data.get("texture_data", {}) if isinstance(data, dict) else {}
+    entry = tex.get(icon_key) if isinstance(tex, dict) else None
+    return _textures_value_to_first_path(entry)
+
+
+def _copy_icon(src_rp: Path, dst_rp: Path, icon_key: str, new_icon_key: str, fallback_texture_ref: str, warnings: List[str]) -> str:
+    texture_ref = _item_texture_lookup(src_rp, icon_key) if icon_key else None
+    if not texture_ref:
+        texture_ref = fallback_texture_ref
     if texture_ref:
-        new_ref = f"textures/item/{safe_name}_{slot_key}"
-        copied["textures"] = _copy_texture_path(rp, texture_ref, new_ref)
-    tex_data[new_icon] = copied
-    _write_json(path, data)
-
-def _patch_manifests(root: Path, bp: Path, rp: Path) -> None:
-    manifests = [p for p in root.rglob("manifest.json")]
-    uuid_map: Dict[str, str] = {}
-    for path in manifests:
-        data = _read_json(path)
-        header = data.get("header", {})
-        if isinstance(header.get("uuid"), str):
-            uuid_map[header["uuid"]] = str(uuid4())
-        for mod in data.get("modules", []):
-            if isinstance(mod, dict) and isinstance(mod.get("uuid"), str):
-                uuid_map[mod["uuid"]] = str(uuid4())
-    for path in manifests:
-        data = _read_json(path)
-        header = data.get("header", {})
-        if header.get("uuid") in uuid_map:
-            header["uuid"] = uuid_map[header["uuid"]]
-        if header.get("min_engine_version", [0,0,0]) < [1, 20, 50]:
-            header["min_engine_version"] = [1, 20, 50]
-        for mod in data.get("modules", []):
-            if isinstance(mod, dict) and mod.get("uuid") in uuid_map:
-                mod["uuid"] = uuid_map[mod["uuid"]]
-        for dep in data.get("dependencies", []):
-            if isinstance(dep, dict) and dep.get("uuid") in uuid_map:
-                dep["uuid"] = uuid_map[dep["uuid"]]
-        _write_json(path, data)
-
-    bp_manifest = _read_json(bp / "manifest.json")
-    bp_manifest["header"]["description"] = "Addon UI generated by Discord bot"
-    modules = bp_manifest.setdefault("modules", [])
-    if not any(m.get("type") == "script" for m in modules if isinstance(m, dict)):
-        modules.append({
-            "type": "script",
-            "language": "javascript",
-            "entry": "scripts/main.js",
-            "uuid": str(uuid4()),
-            "version": [1, 0, 0],
-        })
-    deps = bp_manifest.setdefault("dependencies", [])
-    if not any(d.get("module_name") == "@minecraft/server" for d in deps if isinstance(d, dict)):
-        deps.append({"module_name": "@minecraft/server", "version": "1.10.0"})
-    if not any(d.get("module_name") == "@minecraft/server-ui" for d in deps if isinstance(d, dict)):
-        deps.append({"module_name": "@minecraft/server-ui", "version": "1.2.0"})
-    _write_json(bp / "manifest.json", bp_manifest)
-
-def _merge_main_js(bp: Path) -> None:
-    scripts = bp / "scripts"
-    scripts.mkdir(parents=True, exist_ok=True)
-    main = scripts / "main.js"
-    import_line = 'import "./auto_ui_system.js";'
-    if main.exists():
-        text = main.read_text(encoding="utf-8")
-        if import_line not in text:
-            text = import_line + "\n" + text
-        main.write_text(text, encoding="utf-8")
+        new_ref = _copy_texture_between(src_rp, dst_rp, texture_ref, f"textures/item/{new_icon_key}", warnings)
     else:
-        main.write_text(import_line + "\n", encoding="utf-8")
+        new_ref = f"textures/item/{new_icon_key}"
+        warnings.append(f"ไม่พบ icon texture สำหรับ {icon_key}")
+    return new_ref
+
+
+def _make_manifest_pair(addon_name: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    bp_header_uuid = str(uuid4())
+    bp_module_uuid = str(uuid4())
+    rp_header_uuid = str(uuid4())
+    rp_module_uuid = str(uuid4())
+    bp_manifest = {
+        "format_version": 2,
+        "header": {
+            "name": f"{addon_name} BP",
+            "description": "Normalize/Rebuild UI addon generated by Discord bot",
+            "uuid": bp_header_uuid,
+            "version": [1, 0, 0],
+            "min_engine_version": [1, 20, 50],
+            "icon": "pack_icon.png",
+        },
+        "modules": [
+            {"type": "data", "uuid": bp_module_uuid, "version": [1, 0, 0]},
+            {"type": "script", "language": "javascript", "entry": "scripts/main.js", "uuid": str(uuid4()), "version": [1, 0, 0]},
+        ],
+        "dependencies": [
+            {"uuid": rp_header_uuid, "version": [1, 0, 0]},
+            {"module_name": "@minecraft/server", "version": "1.10.0"},
+            {"module_name": "@minecraft/server-ui", "version": "1.2.0"},
+        ],
+    }
+    rp_manifest = {
+        "format_version": 2,
+        "header": {
+            "name": f"{addon_name} RP",
+            "description": "Normalize/Rebuild UI resources generated by Discord bot",
+            "uuid": rp_header_uuid,
+            "version": [1, 0, 0],
+            "min_engine_version": [1, 20, 50],
+            "icon": "pack_icon.png",
+        },
+        "modules": [
+            {"type": "resources", "uuid": rp_module_uuid, "version": [1, 0, 0]},
+        ],
+        "dependencies": [
+            {"uuid": bp_header_uuid, "version": [1, 0, 0]},
+        ],
+    }
+    return bp_manifest, rp_manifest
+
+
+def _copy_pack_icon(src_bp: Path, src_rp: Path, dst_bp: Path, dst_rp: Path) -> None:
+    for src_dir in (src_bp, src_rp):
+        src = src_dir / "pack_icon.png"
+        if src.exists():
+            shutil.copy2(src, dst_bp / "pack_icon.png")
+            shutil.copy2(src, dst_rp / "pack_icon.png")
+            return
+
 
 def _generate_ui_script(selector_id: str, armors: List[Dict[str, Any]], all_item_ids: List[str], selector_display_name: str) -> str:
     data = json.dumps({
@@ -555,84 +670,116 @@ world.afterEvents.itemUse.subscribe((event) => {{
 }});
 '''
 
-def _lang_label(candidate: AddonItemCandidate, slot_key: str) -> str:
-    slot_th = next((label for key, label, _, _ in SLOTS if key == slot_key), slot_key)
-    return f"{candidate.display_name} ({slot_th})"
+
+def _lang_label(display_name: str, slot_key: str) -> str:
+    slot_th = next((label for key, label, *_ in SLOTS if key == slot_key), slot_key)
+    return f"{display_name} ({slot_th})"
+
+
+def _make_generated_item(identifier: str, icon: str, display_name: str, wearable_slot: str) -> Dict[str, Any]:
+    return {
+        "format_version": "1.20.50",
+        "minecraft:item": {
+            "description": {"identifier": identifier},
+            "components": {
+                "minecraft:icon": icon,
+                "minecraft:max_stack_size": 1,
+                "minecraft:display_name": {"value": display_name},
+                "minecraft:wearable": {"slot": wearable_slot},
+            },
+        },
+    }
+
 
 def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: str) -> str:
+    """Normalize/Rebuild Mode.
+
+    Instead of patching the uploaded addon in-place, this extracts only wearable item
+    metadata, attachables, geometry, animations, render controllers, textures and lang
+    labels, then rebuilds a clean Seraphim-style BP/RP with one visible UI item.
+    """
     src = Path(addon_path)
-    root = Path(work_dir) / "convert"
+    root = Path(work_dir) / "convert_src"
+    out_root = Path(work_dir) / "convert_rebuild"
     if root.exists():
         shutil.rmtree(root)
+    if out_root.exists():
+        shutil.rmtree(out_root)
     _safe_extract(src, root)
-    bp, rp = _find_packs(root)
-    candidates = _scan_candidates(root, bp)
+    src_bp, src_rp = _find_packs(root)
+    candidates = _scan_candidates(root, src_bp)
     selected = [c for c in candidates if c.identifier in set(selected_identifiers)]
     if not selected:
         raise AddonError("ไม่ได้เลือกไอเท็มที่แปลงได้")
 
-    addon_base_name = _addon_base_name(bp, rp)
-    selector_display_name = f"{addon_base_name} item ui"
+    addon_name = _addon_base_name(src_bp, src_rp)
+    safe_addon = _safe_id(addon_name, "auto_ui")
+    selector_display_name = f"{addon_name} item ui"
 
-    _patch_manifests(root, bp, rp)
-    items_dir = bp / "items"
-    selector_ns = "addon_ui"
+    dst_bp = out_root / "BP_auto_ui"
+    dst_rp = out_root / "RP_auto_ui"
+    for d in (dst_bp / "items", dst_bp / "scripts", dst_rp / "attachables", dst_rp / "textures" / "item", dst_rp / "textures" / "models" / "armor", dst_rp / "models" / "entity", dst_rp / "animations", dst_rp / "texts"):
+        d.mkdir(parents=True, exist_ok=True)
+
+    bp_manifest, rp_manifest = _make_manifest_pair(addon_name)
+    _write_json(dst_bp / "manifest.json", bp_manifest)
+    _write_json(dst_rp / "manifest.json", rp_manifest)
+    _copy_pack_icon(src_bp, src_rp, dst_bp, dst_rp)
+
+    selector_ns = _safe_id(f"{safe_addon}_ui", "auto_ui")
     selector_id = f"{selector_ns}:selector"
-
     armors: List[Dict[str, Any]] = []
     all_item_ids: List[str] = []
     lang_lines: List[str] = [f"item.{selector_id}.name={selector_display_name}"]
+    warnings: List[str] = []
+    texture_data: Dict[str, Any] = {}
 
-    for candidate in selected:
-        item_path = root / candidate.file_path
-        original_data = _read_json(item_path)
+    for idx, candidate in enumerate(selected, start=1):
         orig_ns, orig_name = _identifier_parts(candidate.identifier)
-        safe_name = f"{orig_ns}_{orig_name}"
-        new_ns = _safe_id(f"{orig_ns}_ui", "addon_ui")
-        src_attach = _find_attachable_for_item(rp, candidate.identifier)
-        armor_entry = {"name": candidate.display_name, "icon": "", "items": {}}
-        original_icon = candidate.icon or safe_name
+        base = f"armor_{idx:03d}_{orig_ns}_{orig_name}"
+        new_ns = _safe_id(f"{safe_addon}_{idx:03d}", "autoarmor")
+        item_path = root / candidate.file_path
+        try:
+            item_data = _read_json(item_path)
+        except Exception:
+            item_data = {}
+        src_attach = _find_attachable_for_item(src_rp, candidate.identifier, candidate.file_path)
+        if not src_attach:
+            warnings.append(f"ไม่พบ attachable สำหรับ {candidate.identifier}; จะสร้าง attachable พื้นฐาน")
 
-        for slot_key, slot_label, wearable_slot, _slot_enum in SLOTS:
-            new_item_name = f"{orig_name}_{slot_key}"
+        # Prefer explicit icon texture, fallback to first default attachable texture.
+        fallback_texture = ""
+        if src_attach:
+            try:
+                desc = _extract_attachable_desc(src_attach)
+                texs = desc.get("textures", {})
+                if isinstance(texs, dict):
+                    fallback_texture = next((v for v in texs.values() if isinstance(v, str) and v.startswith("textures/") and "enchanted" not in v), "")
+            except Exception:
+                pass
+        icon_key = candidate.icon or f"{base}_icon"
+        generated_icon_key = f"{base}_icon"
+        icon_ref = _copy_icon(src_rp, dst_rp, icon_key, generated_icon_key, fallback_texture, warnings)
+        texture_data[generated_icon_key] = {"textures": icon_ref}
+
+        armor_entry = {
+            "name": candidate.display_name,
+            "icon": icon_ref,
+            "items": {},
+        }
+        for slot_key, slot_label, wearable_slot, _slot_enum, _slot_layer in SLOTS:
+            new_item_name = f"{base}_{slot_key}"
             new_item_id = f"{new_ns}:{new_item_name}"
-            new_icon = f"{safe_name}_{slot_key}"
             all_item_ids.append(new_item_id)
             armor_entry["items"][slot_key] = new_item_id
-            if not armor_entry["icon"]:
-                armor_entry["icon"] = f"textures/item/{new_icon}"
-
-            new_item = json.loads(json.dumps(original_data))
-            item = new_item.setdefault("minecraft:item", {})
-            desc = item.setdefault("description", {})
-            desc["identifier"] = new_item_id
-            _hide_item_from_creative(new_item)
-            comps = item.setdefault("components", {})
-            comps["minecraft:wearable"] = {"slot": wearable_slot}
-            comps["minecraft:icon"] = new_icon
-            comps["minecraft:display_name"] = {"value": _lang_label(candidate, slot_key)}
-            out_item = items_dir / f"{new_item_name}.json"
-            _write_json(out_item, new_item)
-
-            _patch_item_texture(rp, original_icon, new_icon, f"{safe_name}", slot_key)
-            _patch_attachable_for_slot(rp, src_attach, candidate.identifier, new_item_id, safe_name, slot_key)
-            lang_lines.append(f"item.{new_item_id}.name={_lang_label(candidate, slot_key)}")
-            lang_lines.append(f"item.{new_item_name}.name={_lang_label(candidate, slot_key)}")
-
+            label = _lang_label(candidate.display_name, slot_key)
+            item_json = _make_generated_item(new_item_id, generated_icon_key, label, wearable_slot)
+            _write_json(dst_bp / "items" / f"{new_item_name}.json", item_json)
+            _normalize_attachable_for_slot(src_rp, dst_rp, src_attach, new_item_id, base, slot_key, warnings)
+            lang_lines.append(f"item.{new_item_id}.name={label}")
+            lang_lines.append(f"item.{new_item_name}.name={label}")
         armors.append(armor_entry)
 
-    # Hide every original wearable item found in this addon, not only selected items.
-    # The converted addon should expose only the UI opener in Creative inventory.
-    for candidate in candidates:
-        try:
-            item_path = root / candidate.file_path
-            original_data = _read_json(item_path)
-            if _hide_item_from_creative(original_data):
-                _write_json(item_path, original_data)
-        except Exception:
-            pass
-
-    # Selector visible item.
     selector_item = {
         "format_version": "1.20.50",
         "minecraft:item": {
@@ -641,25 +788,45 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
                 "menu_category": {"category": "equipment", "group": "itemGroup.name.leggings"},
             },
             "components": {
-                "minecraft:icon": selected[0].icon or "diamond",
+                "minecraft:icon": next(iter(texture_data.keys()), "diamond"),
                 "minecraft:display_name": {"value": selector_display_name},
                 "minecraft:max_stack_size": 1,
                 "minecraft:allow_off_hand": True,
             },
         },
     }
-    _write_json(items_dir / "addon_ui_selector.json", selector_item)
+    _write_json(dst_bp / "items" / "addon_ui_selector.json", selector_item)
 
-    scripts = bp / "scripts"
-    scripts.mkdir(exist_ok=True)
-    (scripts / "auto_ui_system.js").write_text(_generate_ui_script(selector_id, armors, all_item_ids, selector_display_name), encoding="utf-8")
-    _merge_main_js(bp)
+    _write_json(dst_rp / "textures" / "item_texture.json", {
+        "resource_pack_name": "auto_ui",
+        "texture_name": "atlas.items",
+        "texture_data": texture_data,
+    })
 
-    texts = rp / "texts"
-    texts.mkdir(parents=True, exist_ok=True)
+    (dst_bp / "scripts" / "main.js").write_text('import "./auto_ui_system.js";\n', encoding="utf-8")
+    (dst_bp / "scripts" / "auto_ui_system.js").write_text(_generate_ui_script(selector_id, armors, all_item_ids, selector_display_name), encoding="utf-8")
+
+    unique_lang = list(dict.fromkeys(lang_lines))
     for lang_name in ["en_US.lang", "th_TH.lang"]:
-        (texts / lang_name).write_text("\n".join(dict.fromkeys(lang_lines)) + "\n", encoding="utf-8")
-    (texts / "languages.json").write_text(json.dumps(["en_US", "th_TH"], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (dst_rp / "texts" / lang_name).write_text("\n".join(unique_lang) + "\n", encoding="utf-8")
+    (dst_rp / "texts" / "languages.json").write_text(json.dumps(["en_US", "th_TH"], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    report = [
+        "Normalize/Rebuild Mode report",
+        f"Source: {src.name}",
+        f"Addon name: {addon_name}",
+        f"Selected items: {len(selected)}",
+        "",
+        "Converted identifiers:",
+    ]
+    for armor in armors:
+        report.append(f"- {armor['name']}")
+        for slot_key, item_id in armor["items"].items():
+            report.append(f"  {slot_key}: {item_id}")
+    if warnings:
+        report.extend(["", "Warnings:"])
+        report.extend(f"- {w}" for w in warnings)
+    (out_root / "NORMALIZE_REPORT.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
 
     output_stem = src.stem
     if output_stem.lower().endswith(".mcaddon"):
@@ -668,7 +835,12 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
     if out_path.exists():
         out_path.unlink()
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in sorted(root.rglob("*")):
+        for path in sorted(out_root.rglob("*")):
             if path.is_file():
-                zf.write(path, path.relative_to(root).as_posix())
+                zf.write(path, path.relative_to(out_root).as_posix())
+    # final validation
+    with zipfile.ZipFile(out_path, "r") as zf:
+        bad = zf.testzip()
+        if bad:
+            raise AddonError(f"zip validation failed at {bad}")
     return str(out_path)
