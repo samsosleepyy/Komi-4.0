@@ -445,9 +445,10 @@ def _normalize_merged_creative_visibility(merged_bp: Path) -> None:
     """Hide wearable armor pieces and move UI/menu items to loose Items.
 
     This protects merged UI addons where source armor pieces may still carry a
-    creative menu_category. It removes menu_category from any wearable item, and
-    if an item looks like a selector/menu item, it is placed in the top-level
-    Items category instead of an armor group.
+    creative menu_category. It removes menu_category from any wearable item so
+    armor pieces stay hidden and can only be used by give/replaceitem. If an
+    item looks like a selector/menu item, it is placed in the top-level
+    Equipment category without an armor sub-group.
     """
     items_root = merged_bp / 'items'
     if not items_root.exists():
@@ -470,8 +471,7 @@ def _normalize_merged_creative_visibility(merged_bp: Path) -> None:
         if 'minecraft:wearable' in comps:
             desc.pop('menu_category', None)
         elif any(token in ident_lower or token in file_stem for token in ('selector', 'ui', 'menu')):
-            if 'menu_category' in desc:
-                desc['menu_category'] = {'category': 'items'}
+            desc['menu_category'] = {'category': 'equipment'}
         _write_json(path, data)
 
 
