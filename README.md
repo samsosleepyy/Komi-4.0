@@ -82,3 +82,8 @@ python bot.py
 ## ความปลอดภัย
 
 โปรเจกต์นี้จะไม่ก๊อปหรือสร้าง invite link จาก server ที่ไม่ได้รับอนุญาต เพราะเป็นข้อมูลทางเข้าของ server อื่น ระบบจะรายงานเฉพาะชื่อ server, id, owner, จำนวนสมาชิก แล้วออกทันที
+
+
+## Render Python version note
+
+This project pins Python to 3.12.8 using both `.python-version` and `PYTHON_VERSION` in `render.yaml`. New Render services may default to Python 3.14, where the old stdlib `audioop` module is removed. `requirements.txt` also includes `audioop-lts` for Python >= 3.13 as a fallback.
