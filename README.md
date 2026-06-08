@@ -58,13 +58,22 @@ Discord : https://discord.gg/FnmWw7nWyq
 
 ผลลัพธ์จะมี `NORMALIZE_REPORT.txt` แนบอยู่ใน addon เพื่อดู mapping/warning
 
-## รวมแอดออน 2 ไฟล์
+## รวมแอดออน 2-5 ไฟล์
 
-โหมดนี้ยังคงอยู่จากเวอร์ชันก่อน:
+โหมดนี้รองรับ preview/edit ก่อนเริ่มสร้างจริง:
 
-- รับ addon 2 ไฟล์
+- รับ addon 2-5 ไฟล์
+- หลังอัปโหลดไฟล์ บอทจะยังไม่เริ่มรวมทันที
+- บอทจะแสดง embed preview ที่มี:
+  - ชื่อ pack ที่จะสร้าง
+  - description/version/icon status ของแต่ละ addon
+  - รายการ item ทั้งหมด พร้อมระบุว่าอยู่ใน addon ไหนและ path ไฟล์ไหน
+- ปุ่ม **แก้ไขชื่อแพค** เปิด modal ให้ใส่ชื่อ output pack ใหม่
+- ปุ่ม **แก้ไขรูป** จะ disabled ปุ่มชั่วคราวและรอให้ผู้ใช้อัปโหลดรูป pack icon ใน ticket
+- ปุ่ม **เริ่มสร้าง** จะเริ่มรวม addon โดยใช้ชื่อแพคและรูปที่แก้ไว้
 - รวมเป็น `BP_merged` และ `RP_merged`
 - สุ่ม UUID ใหม่
+- ถ้ามี pack icon จะใส่เป็น `pack_icon.png` ทั้ง BP/RP และ patch manifest header.icon
 - แยก scripts เดิมเป็น `scripts/addon_<prefix>/...`
 - สร้าง main.js ใหม่สำหรับ import script entry ของแต่ละ addon
 - prefix identifiers/geometry/animation/controller/texture เพื่อลดการชนกัน
