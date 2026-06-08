@@ -93,3 +93,10 @@ This project pins Python to 3.12.8 using both `.python-version` and `PYTHON_VERS
 เวอร์ชันนี้มี health server เล็ก ๆ ที่ bind กับ `PORT` ของ Render อัตโนมัติ (`/` และ `/healthz`) ดังนั้นถ้า deploy เป็น Web Service จะไม่เจอปัญหา `No open ports detected` แล้ว
 
 อย่างไรก็ตาม สำหรับ Discord bot แนะนำใช้ Background Worker มากกว่า เพราะบอทไม่ได้ต้องรับ traffic HTTP จริง ๆ
+
+## Update notes
+
+- Original wearable addon items are hidden from Creative inventory after conversion.
+- Only the generated UI item is visible in Creative.
+- Generated UI item name is based on the addon pack name without BP/RP suffix: `<Addon Name> item ui`.
+- Armor selection UI includes the SamSoSleepy branding line.
