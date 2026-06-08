@@ -547,7 +547,7 @@ def _generate_ui_script(selector_id: str, armors: List[Dict[str, Any]], all_item
         "armors": armors,
         "allItems": all_item_ids,
     }, ensure_ascii=False, indent=2)
-    return f'''import {{ world, system, EquipmentSlot }} from "@minecraft/server";
+    return f'''import {{ world, system, EquipmentSlot, ItemStack }} from "@minecraft/server";
 import {{ ActionFormData, MessageFormData }} from "@minecraft/server-ui";
 
 const CONFIG = {data};
@@ -589,17 +589,39 @@ async function runPlayerCommand(player, command) {{
   }}
 }}
 
-async function clearArmorSlot(player, slot) {{
-  const ok = await runPlayerCommand(player, `replaceitem entity @s ${{slot.commandSlot}} 0 minecraft:air 1 0`);
-  if (ok) return true;
+function getEquippable(player) {{
   try {{
-    const equipment = player.getComponent("minecraft:equippable");
-    if (!equipment) return false;
-    equipment.setEquipment(slot.equipmentSlot, undefined);
-    return true;
+    return player.getComponent("minecraft:equippable");
   }} catch (error) {{
-    return false;
+    return undefined;
   }}
+}}
+
+function purgeFromInventory(player, itemId) {{
+  try {{
+    const inventory = player.getComponent("minecraft:inventory");
+    const container = inventory && inventory.container;
+    if (!container) return;
+    for (let i = 0; i < container.size; i++) {{
+      const item = container.getItem(i);
+      if (item && item.typeId === itemId) container.setItem(i, undefined);
+    }}
+  }} catch (error) {{}}
+}}
+
+async function clearArmorSlot(player, slot) {{
+  // Eldoria-style path: hidden category:none wearable items should be handled
+  // through the equippable component first. The replaceitem command can reject
+  // hidden/custom wearables on some Bedrock versions.
+  try {{
+    const equipment = getEquippable(player);
+    if (equipment) {{
+      equipment.setEquipment(slot.equipmentSlot, undefined);
+      return true;
+    }}
+  }} catch (error) {{}}
+  const ok = await runPlayerCommand(player, `replaceitem entity @s ${{slot.commandSlot}} 0 minecraft:air 1 0`);
+  return ok;
 }}
 
 async function clearAllAddonArmorFromOtherSlots(player, targetSlot) {{
@@ -611,6 +633,22 @@ async function clearAllAddonArmorFromOtherSlots(player, targetSlot) {{
 }}
 
 async function replaceArmor(player, slot, itemId) {{
+  // Same method used by Eldoria: create an ItemStack and place it directly into
+  // the requested armor slot. This keeps category:none items hidden from Creative
+  // while still allowing them to be equipped by the UI system.
+  try {{
+    const equipment = getEquippable(player);
+    if (equipment) {{
+      purgeFromInventory(player, itemId);
+      equipment.setEquipment(slot.equipmentSlot, new ItemStack(itemId, 1));
+      try {{ await system.waitTicks(1); }} catch (error) {{}}
+      const equipped = getEquippedItem(player, slot);
+      if (equipped && equipped.typeId === itemId) {{
+        purgeFromInventory(player, itemId);
+        return true;
+      }}
+    }}
+  }} catch (error) {{}}
   return await runPlayerCommand(player, `replaceitem entity @s ${{slot.commandSlot}} 0 ${{itemId}} 1 0`);
 }}
 
