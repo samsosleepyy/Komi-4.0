@@ -441,6 +441,40 @@ def _copy_texture_files(source: SourcePack, merged_rp: Path) -> None:
         shutil.copy2(path, dst)
 
 
+def _normalize_merged_creative_visibility(merged_bp: Path) -> None:
+    """Hide wearable armor pieces and move UI/menu items to loose Items.
+
+    This protects merged UI addons where source armor pieces may still carry a
+    creative menu_category. It removes menu_category from any wearable item, and
+    if an item looks like a selector/menu item, it is placed in the top-level
+    Items category instead of an armor group.
+    """
+    items_root = merged_bp / 'items'
+    if not items_root.exists():
+        return
+    for path in sorted(items_root.rglob('*.json')):
+        try:
+            data = _read_json(path)
+        except Exception:
+            continue
+        item = data.get('minecraft:item') if isinstance(data, dict) else None
+        if not isinstance(item, dict):
+            continue
+        desc = item.get('description')
+        comps = item.get('components')
+        if not isinstance(desc, dict) or not isinstance(comps, dict):
+            continue
+        identifier = str(desc.get('identifier') or '')
+        file_stem = path.stem.lower()
+        ident_lower = identifier.lower()
+        if 'minecraft:wearable' in comps:
+            desc.pop('menu_category', None)
+        elif any(token in ident_lower or token in file_stem for token in ('selector', 'ui', 'menu')):
+            if 'menu_category' in desc:
+                desc['menu_category'] = {'category': 'items'}
+        _write_json(path, data)
+
+
 
 def _find_pack_icon_path(bp: Path, rp: Path) -> Optional[Path]:
     candidates: List[Path] = []
@@ -642,6 +676,8 @@ def merge_addons(addon_paths: List[str], work_dir: str, pack_name: Optional[str]
         _copy_texture_files(source, merged_rp)
         _patch_texture_key_refs(merged_bp, source.texture_key_mapping)
         _patch_texture_key_refs(merged_rp, source.texture_key_mapping)
+
+    _normalize_merged_creative_visibility(merged_bp)
 
     # Merge item_texture.json.
     texture_data: Dict[str, Any] = {}

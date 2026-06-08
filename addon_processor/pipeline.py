@@ -677,6 +677,9 @@ def _lang_label(display_name: str, slot_key: str) -> str:
 
 
 def _make_generated_item(identifier: str, icon: str, display_name: str, wearable_slot: str) -> Dict[str, Any]:
+    # Armor pieces are real wearable target items used by replaceitem. They must
+    # not appear in the Creative inventory, so description.menu_category is
+    # intentionally omitted. Only the selector UI item gets a menu_category.
     return {
         "format_version": "1.20.50",
         "minecraft:item": {
@@ -689,6 +692,36 @@ def _make_generated_item(identifier: str, icon: str, display_name: str, wearable
             },
         },
     }
+
+
+def _normalize_creative_visibility(items_root: Path, selector_id: str) -> None:
+    """Keep only the UI selector visible in Creative.
+
+    Bedrock shows custom items in Creative through description.menu_category.
+    Wearable generated/original armor pieces must have that field removed; the
+    selector is put in the loose Items category instead of the leggings/equipment
+    group so users do not need to open the pants tab.
+    """
+    if not items_root.exists():
+        return
+    for item_path in items_root.rglob("*.json"):
+        try:
+            data = _read_json(item_path)
+        except Exception:
+            continue
+        item = data.get("minecraft:item") if isinstance(data, dict) else None
+        if not isinstance(item, dict):
+            continue
+        desc = item.get("description")
+        comps = item.get("components")
+        if not isinstance(desc, dict) or not isinstance(comps, dict):
+            continue
+        identifier = str(desc.get("identifier") or "")
+        if identifier == selector_id:
+            desc["menu_category"] = {"category": "items"}
+        elif "minecraft:wearable" in comps:
+            desc.pop("menu_category", None)
+        _write_json(item_path, data)
 
 
 def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: str) -> str:
@@ -785,7 +818,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
         "minecraft:item": {
             "description": {
                 "identifier": selector_id,
-                "menu_category": {"category": "equipment", "group": "itemGroup.name.leggings"},
+                "menu_category": {"category": "items"},
             },
             "components": {
                 "minecraft:icon": next(iter(texture_data.keys()), "diamond"),
@@ -796,6 +829,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
         },
     }
     _write_json(dst_bp / "items" / "addon_ui_selector.json", selector_item)
+    _normalize_creative_visibility(dst_bp / "items", selector_id)
 
     _write_json(dst_rp / "textures" / "item_texture.json", {
         "resource_pack_name": "auto_ui",
