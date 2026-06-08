@@ -173,6 +173,42 @@ def _identifier_parts(identifier: str) -> Tuple[str, str]:
         ns, name = "addon", identifier
     return _safe_id(ns, "addon"), _safe_id(name, "item")
 
+
+def _addon_base_name(bp: Path, rp: Path) -> str:
+    """Return pack display name without BP/RP suffix for selector item name."""
+    for manifest_path in (bp / "manifest.json", rp / "manifest.json"):
+        try:
+            data = _read_json(manifest_path)
+            name = str(data.get("header", {}).get("name", "")).strip()
+        except Exception:
+            continue
+        if not name:
+            continue
+        name = re.sub(r"[\s_\-]*(BP|RP)\s*$", "", name, flags=re.IGNORECASE).strip()
+        if name:
+            return name
+    return "Addon"
+
+def _hide_item_from_creative(item_data: Dict[str, Any]) -> bool:
+    """Hide an item from Creative inventory while keeping identifier usable by commands."""
+    changed = False
+    item = item_data.get("minecraft:item")
+    if not isinstance(item, dict):
+        return False
+    desc = item.get("description")
+    if isinstance(desc, dict):
+        for key in ("menu_category", "category"):
+            if key in desc:
+                desc.pop(key, None)
+                changed = True
+    comps = item.get("components")
+    if isinstance(comps, dict):
+        # Older/custom generated addons can still use this component to show items in Creative.
+        if "minecraft:creative_category" in comps:
+            comps.pop("minecraft:creative_category", None)
+            changed = True
+    return changed
+
 def _find_attachable_for_item(rp: Path, item_id: str) -> Optional[Path]:
     attach_dir = rp / "attachables"
     if not attach_dir.exists():
@@ -389,8 +425,13 @@ def _merge_main_js(bp: Path) -> None:
     else:
         main.write_text(import_line + "\n", encoding="utf-8")
 
-def _generate_ui_script(selector_id: str, armors: List[Dict[str, Any]], all_item_ids: List[str]) -> str:
-    data = json.dumps({"menuItem": selector_id, "armors": armors, "allItems": all_item_ids}, ensure_ascii=False, indent=2)
+def _generate_ui_script(selector_id: str, armors: List[Dict[str, Any]], all_item_ids: List[str], selector_display_name: str) -> str:
+    data = json.dumps({
+        "menuItem": selector_id,
+        "uiTitle": selector_display_name,
+        "armors": armors,
+        "allItems": all_item_ids,
+    }, ensure_ascii=False, indent=2)
     return f'''import {{ world, system, EquipmentSlot }} from "@minecraft/server";
 import {{ ActionFormData, MessageFormData }} from "@minecraft/server-ui";
 
@@ -459,7 +500,9 @@ async function replaceArmor(player, slot, itemId) {{
 }}
 
 async function showArmorMenu(player) {{
-  const form = new ActionFormData().title("รวมไอเท็มใส่ UI").body("เลือกไอเท็มที่ต้องการใส่");
+  const form = new ActionFormData()
+    .title(CONFIG.uiTitle || "รวมไอเท็มใส่ UI")
+    .body("§eเลือกไอเท็มที่ต้องการใส่\\n\\n§b§lAuto convert skin ui§r §7by §eSamSoSleepy\\n§9Discord : §ahttps://discord.gg/FnmWw7nWyq");
   for (const armor of CONFIG.armors) form.button(armor.name, armor.icon || undefined);
   const response = await form.show(player);
   if (response.canceled || response.selection === undefined) return;
@@ -528,6 +571,9 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
     if not selected:
         raise AddonError("ไม่ได้เลือกไอเท็มที่แปลงได้")
 
+    addon_base_name = _addon_base_name(bp, rp)
+    selector_display_name = f"{addon_base_name} item ui"
+
     _patch_manifests(root, bp, rp)
     items_dir = bp / "items"
     selector_ns = "addon_ui"
@@ -535,7 +581,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
 
     armors: List[Dict[str, Any]] = []
     all_item_ids: List[str] = []
-    lang_lines: List[str] = [f"item.{selector_id}.name=รวมไอเท็มใส่ UI"]
+    lang_lines: List[str] = [f"item.{selector_id}.name={selector_display_name}"]
 
     for candidate in selected:
         item_path = root / candidate.file_path
@@ -560,7 +606,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
             item = new_item.setdefault("minecraft:item", {})
             desc = item.setdefault("description", {})
             desc["identifier"] = new_item_id
-            desc.pop("menu_category", None)
+            _hide_item_from_creative(new_item)
             comps = item.setdefault("components", {})
             comps["minecraft:wearable"] = {"slot": wearable_slot}
             comps["minecraft:icon"] = new_icon
@@ -573,13 +619,18 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
             lang_lines.append(f"item.{new_item_id}.name={_lang_label(candidate, slot_key)}")
             lang_lines.append(f"item.{new_item_name}.name={_lang_label(candidate, slot_key)}")
 
-        # Hide original selected item from creative list.
+        armors.append(armor_entry)
+
+    # Hide every original wearable item found in this addon, not only selected items.
+    # The converted addon should expose only the UI opener in Creative inventory.
+    for candidate in candidates:
         try:
-            original_data["minecraft:item"].get("description", {}).pop("menu_category", None)
-            _write_json(item_path, original_data)
+            item_path = root / candidate.file_path
+            original_data = _read_json(item_path)
+            if _hide_item_from_creative(original_data):
+                _write_json(item_path, original_data)
         except Exception:
             pass
-        armors.append(armor_entry)
 
     # Selector visible item.
     selector_item = {
@@ -591,7 +642,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
             },
             "components": {
                 "minecraft:icon": selected[0].icon or "diamond",
-                "minecraft:display_name": {"value": "รวมไอเท็มใส่ UI"},
+                "minecraft:display_name": {"value": selector_display_name},
                 "minecraft:max_stack_size": 1,
                 "minecraft:allow_off_hand": True,
             },
@@ -601,7 +652,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
 
     scripts = bp / "scripts"
     scripts.mkdir(exist_ok=True)
-    (scripts / "auto_ui_system.js").write_text(_generate_ui_script(selector_id, armors, all_item_ids), encoding="utf-8")
+    (scripts / "auto_ui_system.js").write_text(_generate_ui_script(selector_id, armors, all_item_ids, selector_display_name), encoding="utf-8")
     _merge_main_js(bp)
 
     texts = rp / "texts"
@@ -610,7 +661,10 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
         (texts / lang_name).write_text("\n".join(dict.fromkeys(lang_lines)) + "\n", encoding="utf-8")
     (texts / "languages.json").write_text(json.dumps(["en_US", "th_TH"], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    out_path = Path(work_dir) / f"converted_{src.stem}.mcaddon"
+    output_stem = src.stem
+    if output_stem.lower().endswith(".mcaddon"):
+        output_stem = output_stem[:-8]
+    out_path = Path(work_dir) / f"converted_{output_stem}.mcaddon"
     if out_path.exists():
         out_path.unlink()
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
