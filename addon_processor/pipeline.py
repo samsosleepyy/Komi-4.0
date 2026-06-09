@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from uuid import uuid4
 
+try:
+    from PIL import Image
+except Exception:  # Pillow is optional at import time; resize helpers no-op if unavailable.
+    Image = None
+
 SLOTS = [
     ("head", "หัว", "slot.armor.head", "Head", "helmet"),
     ("chest", "ตัว", "slot.armor.chest", "Chest", "chest"),
@@ -48,6 +53,69 @@ def _slot_keys_for_candidate(candidate: "AddonItemCandidate", slot_mode: str = "
 
 
 TEXTURE_EXTS = (".png", ".tga", ".jpg", ".jpeg", ".webp")
+ICON_SIZE = 128
+
+
+def _resize_image_file(path: Path, size: int = ICON_SIZE) -> bool:
+    """Downscale pack icons and item icons so generated addons stay small.
+
+    Only shrinks images larger than size x size. PNG is used for converted
+    pack/custom icons elsewhere; for existing icon files this preserves the
+    original extension where possible.
+    """
+    if Image is None or not path.exists() or path.suffix.lower() not in TEXTURE_EXTS:
+        return False
+    try:
+        with Image.open(path) as img:
+            if img.width <= size and img.height <= size:
+                return False
+            img = img.convert("RGBA")
+            img.thumbnail((size, size), Image.Resampling.LANCZOS)
+            canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            canvas.paste(img, ((size - img.width) // 2, (size - img.height) // 2))
+            save_path = path
+            save_kwargs = {}
+            if path.suffix.lower() in (".jpg", ".jpeg"):
+                canvas = canvas.convert("RGB")
+                save_kwargs.update({"quality": 85, "optimize": True})
+            elif path.suffix.lower() == ".png":
+                save_kwargs.update({"optimize": True})
+            canvas.save(save_path, **save_kwargs)
+            return True
+    except Exception:
+        return False
+
+
+def _resize_item_icon_tree(rp: Path) -> None:
+    for folder_name in ("item", "items"):
+        root = rp / "textures" / folder_name
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in TEXTURE_EXTS:
+                _resize_image_file(path)
+
+
+def _write_resized_icon(src: Path, dst: Path, size: int = ICON_SIZE) -> bool:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if Image is not None and src.exists():
+        try:
+            with Image.open(src) as img:
+                img = img.convert("RGBA")
+                img.thumbnail((size, size), Image.Resampling.LANCZOS)
+                canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+                canvas.paste(img, ((size - img.width) // 2, (size - img.height) // 2))
+                canvas.save(dst, optimize=True)
+                return True
+        except Exception:
+            pass
+    try:
+        shutil.copy2(src, dst)
+        _resize_image_file(dst, size)
+        return True
+    except Exception:
+        return False
+
 BUILTIN_GEOMETRY_PREFIXES = ("geometry.humanoid", "geometry.player")
 BUILTIN_RENDER_PREFIXES = ("controller.render.armor", "controller.render.item")
 BUILTIN_TEXTURE_PREFIXES = ("textures/misc/", "textures/ui/")
@@ -557,8 +625,8 @@ def _copy_pack_icon(src_bp: Path, src_rp: Path, dst_bp: Path, dst_rp: Path) -> N
     for src_dir in (src_bp, src_rp):
         src = src_dir / "pack_icon.png"
         if src.exists():
-            shutil.copy2(src, dst_bp / "pack_icon.png")
-            shutil.copy2(src, dst_rp / "pack_icon.png")
+            _write_resized_icon(src, dst_bp / "pack_icon.png")
+            _write_resized_icon(src, dst_rp / "pack_icon.png")
             return
 
 
@@ -599,6 +667,21 @@ function getEquippedItem(player, slot) {
 
 function isAddonArmor(item) {
   return !!item && ALL_ADDON_ARMOR_ITEMS.has(item.typeId);
+}
+
+function canStackArmor(player) {
+  try {
+    return player.hasTag("auto_ui_stack_armor");
+  } catch (error) {
+    return false;
+  }
+}
+
+function setCanStackArmor(player, enabled) {
+  try {
+    if (enabled) player.addTag("auto_ui_stack_armor");
+    else player.removeTag("auto_ui_stack_armor");
+  } catch (error) {}
 }
 
 function getItemLabel(item) {
@@ -675,19 +758,48 @@ async function replaceArmor(player, slot, itemId) {
 }
 
 async function showArmorMenu(player) {
+  const stackStatus = canStackArmor(player) ? "§aเปิด" : "§cปิด";
   const form = new ActionFormData()
     .title(CONFIG.uiTitle || "รวมไอเท็มใส่ UI")
-    .body("§eเลือกไอเท็มที่ต้องการใส่\n\n§b§lAuto convert skin ui§r §7by §eSamSoSleepy\n§9Discord : §ahttps://discord.gg/FnmWw7nWyq");
+    .body(`§eเลือกไอเท็มที่ต้องการใส่\n§7ใส่ซ้อนกัน: ${stackStatus}\n\n§b§lAuto convert skin ui§r §7by §eSamSoSleepy\n§9Discord : §ahttps://discord.gg/FnmWw7nWyq`);
+  form.button("⚙️ ตั้งค่า");
   for (const armor of CONFIG.armors) form.button(armor.name, armor.icon || undefined);
   const response = await form.show(player);
   if (response.canceled || response.selection === undefined) return;
-  const armor = CONFIG.armors[response.selection];
+  if (response.selection === 0) {
+    await showSettingsMenu(player);
+    return;
+  }
+  const armor = CONFIG.armors[response.selection - 1];
+  if (!armor) return;
   const availableSlots = getAvailableSlots(armor);
   if (availableSlots.length === 1) {
     await equipArmorToSlot(player, armor, availableSlots[0]);
     return;
   }
   await showSlotMenu(player, armor, availableSlots);
+}
+
+async function showSettingsMenu(player) {
+  const enabled = canStackArmor(player);
+  const form = new ActionFormData()
+    .title("⚙️ ตั้งค่า")
+    .body(
+      "เปิด/ปิดการใส่ซ้อนกันได้\n\n" +
+      "§7ปิด: ใส่ช่องใหม่แล้วไอเท็มจาก addon นี้ในช่องอื่นจะถูกถอดออก\n" +
+      "§7เปิด: ใส่หลายช่องพร้อมกันได้ เช่น หัว+ตัว+ขา+เท้า"
+    )
+    .button(enabled ? "ปิดการใส่ซ้อนกัน" : "เปิดการใส่ซ้อนกัน")
+    .button("กลับ");
+  const response = await form.show(player);
+  if (response.canceled || response.selection === undefined) return;
+  if (response.selection === 0) {
+    setCanStackArmor(player, !enabled);
+    player.sendMessage(!enabled ? "§aเปิดการใส่ซ้อนกันแล้ว" : "§eปิดการใส่ซ้อนกันแล้ว");
+    await showArmorMenu(player);
+    return;
+  }
+  await showArmorMenu(player);
 }
 
 async function showSlotMenu(player, armor, availableSlots) {
@@ -715,7 +827,7 @@ async function equipArmorToSlot(player, armor, slot) {
     await showOverwriteMenu(player, armor, slot, existing, itemId);
     return;
   }
-  await clearAllAddonArmorFromOtherSlots(player, slot);
+  if (!canStackArmor(player)) await clearAllAddonArmorFromOtherSlots(player, slot);
   const ok = await replaceArmor(player, slot, itemId);
   player.sendMessage(ok ? `§aใส่ ${armor.name} ที่ช่อง${slot.label}แล้ว` : "§cใส่ไอเท็มไม่สำเร็จ");
 }
@@ -732,7 +844,7 @@ async function showOverwriteMenu(player, armor, slot, existing, itemId) {
     .button2("ยกเลิก");
   const response = await form.show(player);
   if (response.canceled || response.selection !== 0) return;
-  await clearAllAddonArmorFromOtherSlots(player, slot);
+  if (!canStackArmor(player)) await clearAllAddonArmorFromOtherSlots(player, slot);
   const ok = await replaceArmor(player, slot, itemId);
   player.sendMessage(ok ? `§aทับไอเท็มเดิมและใส่ ${armor.name} ที่ช่อง${slot.label}แล้ว` : "§cใส่ไอเท็มไม่สำเร็จ");
 }
@@ -922,6 +1034,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
         "texture_name": "atlas.items",
         "texture_data": texture_data,
     })
+    _resize_item_icon_tree(dst_rp)
 
     (dst_bp / "scripts" / "main.js").write_text('import "./auto_ui_system.js";\n', encoding="utf-8")
     (dst_bp / "scripts" / "auto_ui_system.js").write_text(_generate_ui_script(selector_id, armors, all_item_ids, selector_display_name), encoding="utf-8")

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from uuid import uuid4
 
-from .pipeline import AddonError, _find_packs, _read_json, _safe_extract, _safe_id, _write_json
+from .pipeline import AddonError, _find_packs, _read_json, _safe_extract, _safe_id, _write_json, _resize_image_file, _resize_item_icon_tree, _write_resized_icon
 
 TEXT_EXTS = {'.json', '.js', '.mcfunction', '.lang', '.txt'}
 IMAGE_EXTS = {'.png', '.tga', '.jpg', '.jpeg', '.webp'}
@@ -341,7 +341,10 @@ def _copy_pack_files(src_root: Path, dst_root: Path, prefix: str, mapping: Dict[
             continue
         is_script = is_bp and len(rel.parts) > 0 and rel.parts[0] == 'scripts'
         dst_rel = _relative_dest(rel, prefix, is_script=is_script)
-        _copy_text_or_binary(path, dst_root / dst_rel, mapping)
+        dst_path = dst_root / dst_rel
+        _copy_text_or_binary(path, dst_path, mapping)
+        if rel.name.lower().startswith('pack_icon') and dst_path.suffix.lower() in IMAGE_EXTS:
+            _resize_image_file(dst_path)
 
 
 
@@ -439,16 +442,56 @@ def _copy_texture_files(source: SourcePack, merged_rp: Path) -> None:
             dst = merged_rp / rel.with_name(f'{source.prefix}_{rel.name}')
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, dst)
+        rel_parts = dst.relative_to(merged_rp).parts
+        if len(rel_parts) >= 2 and rel_parts[0] == 'textures' and rel_parts[1] in {'item', 'items'}:
+            _resize_image_file(dst)
+
+
+def _texture_entry_paths(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        paths: List[str] = []
+        for item in value:
+            paths.extend(_texture_entry_paths(item))
+        return paths
+    if isinstance(value, dict):
+        paths: List[str] = []
+        for key in ('textures', 'path', 'texture'):
+            if key in value:
+                paths.extend(_texture_entry_paths(value[key]))
+        return paths
+    return []
+
+
+def _resize_item_texture_references(merged_rp: Path) -> None:
+    item_texture = merged_rp / 'textures' / 'item_texture.json'
+    if not item_texture.exists():
+        return
+    try:
+        data = _read_json(item_texture)
+    except Exception:
+        return
+    tex_data = data.get('texture_data', {}) if isinstance(data, dict) else {}
+    if not isinstance(tex_data, dict):
+        return
+    for entry in tex_data.values():
+        for ref in _texture_entry_paths(entry):
+            if not isinstance(ref, str) or not ref.startswith('textures/'):
+                continue
+            for ext in IMAGE_EXTS:
+                path = merged_rp / f'{ref}{ext}'
+                if path.exists():
+                    _resize_image_file(path)
 
 
 def _normalize_merged_creative_visibility(merged_bp: Path) -> None:
-    """Hide wearable armor pieces and keep UI/menu items visible in Equipment.
+    """Put merged-addon items in the top-level Equipment category.
 
-    This protects merged UI addons where source armor pieces may still carry a
-    creative menu_category. Wearable items are moved to explicit category
-    "none" so they are hidden from every Creative tab and can only be used by
-    give/replaceitem. If an item looks like a selector/menu item, it is placed
-    in the top-level Equipment category without an armor sub-group.
+    Merge mode is not the same as UI conversion mode. The user wants the
+    original merged items to remain visible, so every custom BP/items entry is
+    placed in Equipment. The UI-conversion pipeline still hides generated armor
+    pieces with category "none" and keeps only the selector visible.
     """
     items_root = merged_bp / 'items'
     if not items_root.exists():
@@ -462,18 +505,13 @@ def _normalize_merged_creative_visibility(merged_bp: Path) -> None:
         if not isinstance(item, dict):
             continue
         desc = item.get('description')
-        comps = item.get('components')
-        if not isinstance(desc, dict) or not isinstance(comps, dict):
+        if not isinstance(desc, dict):
             continue
         identifier = str(desc.get('identifier') or '')
-        file_stem = path.stem.lower()
-        ident_lower = identifier.lower()
-        if 'minecraft:wearable' in comps:
-            desc['menu_category'] = {'category': 'none'}
-        elif any(token in ident_lower or token in file_stem for token in ('selector', 'ui', 'menu')):
-            desc['menu_category'] = {'category': 'equipment'}
+        if identifier.startswith('minecraft:'):
+            continue
+        desc['menu_category'] = {'category': 'equipment'}
         _write_json(path, data)
-
 
 
 def _find_pack_icon_path(bp: Path, rp: Path) -> Optional[Path]:
@@ -687,6 +725,7 @@ def merge_addons(addon_paths: List[str], work_dir: str, pack_name: Optional[str]
                 key = f'{source.prefix}_{key}'
             texture_data[key] = value
     _write_json(merged_rp / 'textures' / 'item_texture.json', {'resource_pack_name': 'vanilla', 'texture_name': 'atlas.items', 'texture_data': texture_data})
+    _resize_item_texture_references(merged_rp)
 
     # Merge lang files and languages.json.
     lang_data: Dict[str, List[str]] = {}
@@ -707,8 +746,9 @@ def merge_addons(addon_paths: List[str], work_dir: str, pack_name: Optional[str]
     icon_source = Path(pack_icon_path) if pack_icon_path else None
     has_icon = bool(icon_source and icon_source.exists() and icon_source.is_file())
     if has_icon:
-        shutil.copy2(icon_source, merged_bp / 'pack_icon.png')
-        shutil.copy2(icon_source, merged_rp / 'pack_icon.png')
+        _write_resized_icon(icon_source, merged_bp / 'pack_icon.png')
+        _write_resized_icon(icon_source, merged_rp / 'pack_icon.png')
+    _resize_item_icon_tree(merged_rp)
     _write_merged_manifests(merged_bp, merged_rp, sources, has_scripts, pack_name=pack_name, has_icon=has_icon)
 
     warnings: List[str] = []
@@ -719,8 +759,8 @@ def merge_addons(addon_paths: List[str], work_dir: str, pack_name: Optional[str]
         'Merged Addons Report',
         '====================',
         '',
-        f'Output pack name: {str(pack_name or 'Merged Addons').strip() or 'Merged Addons'}',
-        f'Output pack icon: {'custom/default icon applied' if pack_icon_path else 'not set'}',
+        f"Output pack name: {str(pack_name or 'Merged Addons').strip() or 'Merged Addons'}",
+        f"Output pack icon: {'custom/default icon applied' if pack_icon_path else 'not set'}",
         '',
         'Sources:',
         *[f'- {s.source_path.name} -> prefix {s.prefix}' for s in sources],
