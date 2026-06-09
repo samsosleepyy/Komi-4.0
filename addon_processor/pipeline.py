@@ -97,11 +97,20 @@ def _resize_item_icon_tree(rp: Path) -> None:
 
 
 def _write_resized_icon(src: Path, dst: Path, size: int = ICON_SIZE) -> bool:
+    """Write an icon without upscaling small images.
+
+    If the source is already 128x128 or smaller, keep its original pixel size
+    (only converting container format when the destination extension requires it).
+    If it is larger, shrink it into a 128x128 transparent canvas.
+    """
     dst.parent.mkdir(parents=True, exist_ok=True)
     if Image is not None and src.exists():
         try:
             with Image.open(src) as img:
                 img = img.convert("RGBA")
+                if img.width <= size and img.height <= size:
+                    img.save(dst, optimize=True)
+                    return True
                 img.thumbnail((size, size), Image.Resampling.LANCZOS)
                 canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
                 canvas.paste(img, ((size - img.width) // 2, (size - img.height) // 2))
@@ -128,6 +137,7 @@ class AddonItemCandidate:
     file_path: str
     wearable_slot: str
     icon: str
+    item_kind: str = "wearable"
 
 @dataclass
 class AddonInspection:
@@ -208,6 +218,13 @@ def _icon_from_item(item_data: Dict[str, Any]) -> str:
     return ""
 
 
+def _allow_off_hand_from_item(item_data: Dict[str, Any]) -> bool:
+    comps = item_data.get("minecraft:item", {}).get("components", {})
+    value = comps.get("minecraft:allow_off_hand")
+    # Bedrock packs usually use true, but some generators emit an empty object.
+    return value is True or isinstance(value, dict)
+
+
 def _scan_candidates(root: Path, bp: Path) -> List[AddonItemCandidate]:
     items_dir = bp / "items"
     candidates: List[AddonItemCandidate] = []
@@ -223,13 +240,17 @@ def _scan_candidates(root: Path, bp: Path) -> List[AddonItemCandidate]:
             continue
         desc = item.get("description", {})
         comps = item.get("components", {})
-        wearable = comps.get("minecraft:wearable")
-        if not isinstance(wearable, dict):
+        if not isinstance(desc, dict) or not isinstance(comps, dict):
             continue
         identifier = desc.get("identifier")
         if not identifier:
             continue
-        slot = wearable.get("slot", "")
+        wearable = comps.get("minecraft:wearable")
+        is_wearable = isinstance(wearable, dict)
+        is_offhand = (not is_wearable) and _allow_off_hand_from_item(data)
+        if not is_wearable and not is_offhand:
+            continue
+        slot = wearable.get("slot", "") if is_wearable else "slot.weapon.offhand"
         display = _display_name_from_item(data, identifier.split(":")[-1])
         candidates.append(AddonItemCandidate(
             index=len(candidates),
@@ -238,9 +259,9 @@ def _scan_candidates(root: Path, bp: Path) -> List[AddonItemCandidate]:
             file_path=str(path.relative_to(root)).replace(os.sep, "/"),
             wearable_slot=slot,
             icon=_icon_from_item(data),
+            item_kind="wearable" if is_wearable else "offhand",
         ))
     return candidates
-
 
 def inspect_addon(addon_path: str, work_dir: str) -> AddonInspection:
     src = Path(addon_path)
@@ -255,7 +276,7 @@ def inspect_addon(addon_path: str, work_dir: str) -> AddonInspection:
     bp, rp = _find_packs(root)
     candidates = _scan_candidates(root, bp)
     if not candidates:
-        raise AddonError("ไม่พบไอเท็มเกราะที่มี minecraft:wearable")
+        raise AddonError("ไม่พบไอเท็มที่แปลงได้ (ต้องเป็นเกราะ minecraft:wearable หรือไอเท็มที่เปิด minecraft:allow_off_hand)")
     return AddonInspection(
         source_path=str(src),
         bp_dir=str(bp.relative_to(root)).replace(os.sep, "/"),
@@ -557,6 +578,64 @@ def _normalize_attachable_for_slot(src_rp: Path, dst_rp: Path, src_attach: Optio
     _write_json(dst_rp / "attachables" / f"{base}_{slot_key}.json", attachable)
 
 
+def _normalize_attachable_for_item(src_rp: Path, dst_rp: Path, src_attach: Optional[Path], new_item_id: str, base: str, warnings: List[str]) -> None:
+    if not src_attach:
+        return
+    desc = _extract_attachable_desc(src_attach)
+    desc["identifier"] = new_item_id
+    desc["item"] = {new_item_id: "query.owner_identifier=='minecraft:player'"}
+
+    textures = desc.get("textures")
+    if isinstance(textures, dict):
+        for key, value in list(textures.items()):
+            if isinstance(value, str) and value.startswith("textures/") and "enchanted" not in value:
+                textures[key] = _copy_texture_between(src_rp, dst_rp, value, f"textures/models/item/{base}_{_safe_id(key, 'tex')}", warnings)
+
+    geometries = desc.get("geometry")
+    if isinstance(geometries, dict):
+        for key, value in list(geometries.items()):
+            if isinstance(value, str) and value.startswith("geometry."):
+                new_geo_id = f"geometry.{base}_{_safe_id(key, 'geo')}"
+                geometries[key] = _copy_geometry_normalized(src_rp, dst_rp, value, new_geo_id, f"{base}_{_safe_id(key, 'geo')}", warnings)
+
+    animations = desc.get("animations")
+    if isinstance(animations, dict):
+        for key, value in list(animations.items()):
+            if isinstance(value, str) and value.startswith("animation."):
+                new_anim_id = f"animation.{base}_{_safe_id(key, 'anim')}"
+                animations[key] = _copy_animation_normalized(src_rp, dst_rp, value, new_anim_id, f"{base}_{_safe_id(key, 'anim')}", warnings)
+
+    render_controllers = desc.get("render_controllers")
+    if isinstance(render_controllers, list):
+        new_rcs = []
+        for i, value in enumerate(render_controllers):
+            if isinstance(value, str) and value.startswith("controller.render."):
+                new_rc_id = f"controller.render.{base}_{i}"
+                new_rcs.append(_copy_render_controller_normalized(src_rp, dst_rp, value, new_rc_id, f"{base}_{i}", warnings))
+            else:
+                new_rcs.append(value)
+        desc["render_controllers"] = new_rcs
+
+    attachable = {"format_version": "1.10.0", "minecraft:attachable": {"description": desc}}
+    _write_json(dst_rp / "attachables" / f"{base}_offhand.json", attachable)
+
+
+def _make_generated_offhand_item(src_item_data: Dict[str, Any], identifier: str, icon: str, display_name: str) -> Dict[str, Any]:
+    data = json.loads(json.dumps(src_item_data)) if isinstance(src_item_data, dict) else {}
+    item = data.setdefault("minecraft:item", {})
+    desc = item.setdefault("description", {})
+    comps = item.setdefault("components", {})
+    desc["identifier"] = identifier
+    desc["menu_category"] = {"category": "none"}
+    comps["minecraft:icon"] = icon
+    comps["minecraft:display_name"] = {"value": display_name}
+    comps["minecraft:allow_off_hand"] = True
+    comps.setdefault("minecraft:max_stack_size", 1)
+    comps.pop("minecraft:wearable", None)
+    data.setdefault("format_version", "1.20.50")
+    return data
+
+
 def _item_texture_lookup(src_rp: Path, icon_key: str) -> Optional[str]:
     _, data = _load_item_texture_data(src_rp)
     tex = data.get("texture_data", {}) if isinstance(data, dict) else {}
@@ -659,14 +738,16 @@ def _generate_ui_script(selector_id: str, armors: List[Dict[str, Any]], all_item
 import { ActionFormData, MessageFormData, ModalFormData } from "@minecraft/server-ui";
 
 const CONFIG = __CONFIG_JSON__;
-const SLOTS = [
-  { key: "head", label: "หัว", commandSlot: "slot.armor.head", equipmentSlot: EquipmentSlot.Head },
-  { key: "chest", label: "ตัว", commandSlot: "slot.armor.chest", equipmentSlot: EquipmentSlot.Chest },
-  { key: "legs", label: "กางเกง", commandSlot: "slot.armor.legs", equipmentSlot: EquipmentSlot.Legs },
-  { key: "feet", label: "รองเท้า", commandSlot: "slot.armor.feet", equipmentSlot: EquipmentSlot.Feet },
+const ARMOR_SLOTS = [
+  { key: "head", label: "หัว", commandSlot: "slot.armor.head", equipmentSlot: EquipmentSlot.Head, isArmor: true },
+  { key: "chest", label: "ตัว", commandSlot: "slot.armor.chest", equipmentSlot: EquipmentSlot.Chest, isArmor: true },
+  { key: "legs", label: "กางเกง", commandSlot: "slot.armor.legs", equipmentSlot: EquipmentSlot.Legs, isArmor: true },
+  { key: "feet", label: "รองเท้า", commandSlot: "slot.armor.feet", equipmentSlot: EquipmentSlot.Feet, isArmor: true },
 ];
+const OFFHAND_SLOT = { key: "offhand", label: "มือซ้าย", commandSlot: "slot.weapon.offhand", equipmentSlot: EquipmentSlot.Offhand, isArmor: false };
+const SLOTS = [...ARMOR_SLOTS, OFFHAND_SLOT];
 const SLOT_BY_KEY = new Map(SLOTS.map((slot) => [slot.key, slot]));
-const ALL_ADDON_ARMOR_ITEMS = new Set(CONFIG.allItems);
+const ALL_ADDON_ITEMS = new Set(CONFIG.allItems);
 const ITEM_INFO = new Map();
 for (const armor of CONFIG.armors) {
   for (const [slotKey, itemId] of Object.entries(armor.items || {})) {
@@ -690,8 +771,8 @@ function getEquippedItem(player, slot) {
   }
 }
 
-function isAddonArmor(item) {
-  return !!item && ALL_ADDON_ARMOR_ITEMS.has(item.typeId);
+function isAddonItem(item) {
+  return !!item && ALL_ADDON_ITEMS.has(item.typeId);
 }
 
 function canStackArmor(player) {
@@ -745,7 +826,7 @@ function purgeFromInventory(player, itemId) {
   } catch (error) {}
 }
 
-async function clearArmorSlot(player, slot) {
+async function clearEquipmentSlot(player, slot) {
   try {
     const equipment = getEquippable(player);
     if (equipment) {
@@ -758,14 +839,14 @@ async function clearArmorSlot(player, slot) {
 }
 
 async function clearAllAddonArmorFromOtherSlots(player, targetSlot) {
-  for (const slot of SLOTS) {
+  for (const slot of ARMOR_SLOTS) {
     if (slot.key === targetSlot.key) continue;
     const existing = getEquippedItem(player, slot);
-    if (isAddonArmor(existing)) await clearArmorSlot(player, slot);
+    if (isAddonItem(existing)) await clearEquipmentSlot(player, slot);
   }
 }
 
-async function replaceArmor(player, slot, itemId) {
+async function replaceEquipment(player, slot, itemId) {
   try {
     const equipment = getEquippable(player);
     if (equipment) {
@@ -804,7 +885,7 @@ async function showArmorMenu(player) {
   if (!armor) return;
   const availableSlots = getAvailableSlots(armor);
   if (availableSlots.length === 1) {
-    await equipArmorToSlot(player, armor, availableSlots[0]);
+    await equipItemToSlot(player, armor, availableSlots[0]);
     return;
   }
   await showSlotMenu(player, armor, availableSlots);
@@ -826,50 +907,50 @@ async function showSettingsMenu(player) {
   await showArmorMenu(player);
 }
 
-function getEquippedAddonArmors(player) {
+function getEquippedAddonItems(player) {
   const equipped = [];
   for (const slot of SLOTS) {
     const item = getEquippedItem(player, slot);
-    if (!isAddonArmor(item)) continue;
+    if (!isAddonItem(item)) continue;
     equipped.push({ slot, item, info: ITEM_INFO.get(item.typeId) });
   }
   return equipped;
 }
 
-async function removeEquippedArmor(player, entry) {
+async function removeEquippedItem(player, entry) {
   if (!entry || !entry.slot) return;
-  const ok = await clearArmorSlot(player, entry.slot);
+  const ok = await clearEquipmentSlot(player, entry.slot);
   if (entry.item) purgeFromInventory(player, entry.item.typeId);
   const label = entry.info && entry.info.armor ? entry.info.armor.name : (entry.item ? entry.item.typeId : "ไอเท็ม");
   player.sendMessage(ok ? `§aถอด ${label} จากช่อง${entry.slot.label}แล้ว` : "§cถอดไอเท็มไม่สำเร็จ");
 }
 
 async function showRemoveMenu(player) {
-  const equipped = getEquippedAddonArmors(player);
+  const equipped = getEquippedAddonItems(player);
   if (!equipped.length) {
-    player.sendMessage("§eตอนนี้ไม่ได้ใส่เกราะของ addon นี้อยู่");
+    player.sendMessage("§eตอนนี้ไม่ได้ใส่ไอเท็มของ addon นี้อยู่");
     return;
   }
   if (equipped.length === 1) {
-    await removeEquippedArmor(player, equipped[0]);
+    await removeEquippedItem(player, equipped[0]);
     return;
   }
   const form = new ActionFormData()
     .title("ถอดออก")
-    .body("เลือกเกราะของ addon นี้ที่ต้องการถอด");
+    .body("เลือกไอเท็มของ addon นี้ที่ต้องการถอด");
   for (const entry of equipped) {
     const name = entry.info && entry.info.armor ? entry.info.armor.name : entry.item.typeId;
     form.button(`§c${name} (${entry.slot.label})`);
   }
   const response = await form.show(player);
   if (response.canceled || response.selection === undefined) return;
-  await removeEquippedArmor(player, equipped[response.selection]);
+  await removeEquippedItem(player, equipped[response.selection]);
 }
 
 async function showSlotMenu(player, armor, availableSlots) {
   const slots = availableSlots && availableSlots.length ? availableSlots : getAvailableSlots(armor);
   if (slots.length === 1) {
-    await equipArmorToSlot(player, armor, slots[0]);
+    await equipItemToSlot(player, armor, slots[0]);
     return;
   }
   const form = new ActionFormData().title(armor.name).body("เลือกช่องที่จะใส่");
@@ -877,10 +958,10 @@ async function showSlotMenu(player, armor, availableSlots) {
   const response = await form.show(player);
   if (response.canceled || response.selection === undefined) return;
   const slot = slots[response.selection];
-  await equipArmorToSlot(player, armor, slot);
+  await equipItemToSlot(player, armor, slot);
 }
 
-async function equipArmorToSlot(player, armor, slot) {
+async function equipItemToSlot(player, armor, slot) {
   const itemId = armor.items[slot.key];
   if (!itemId) {
     player.sendMessage("§cไอเท็มนี้ไม่ได้เปิดให้ใส่ช่องนี้");
@@ -891,14 +972,14 @@ async function equipArmorToSlot(player, armor, slot) {
     await showOverwriteMenu(player, armor, slot, existing, itemId);
     return;
   }
-  if (!canStackArmor(player)) await clearAllAddonArmorFromOtherSlots(player, slot);
-  const ok = await replaceArmor(player, slot, itemId);
+  if (slot.isArmor !== false && !canStackArmor(player)) await clearAllAddonArmorFromOtherSlots(player, slot);
+  const ok = await replaceEquipment(player, slot, itemId);
   player.sendMessage(ok ? `§aใส่ ${armor.name} ที่ช่อง${slot.label}แล้ว` : "§cใส่ไอเท็มไม่สำเร็จ");
 }
 
 async function showOverwriteMenu(player, armor, slot, existing, itemId) {
   const existingName = getItemLabel(existing);
-  const note = isAddonArmor(existing)
+  const note = isAddonItem(existing)
     ? "ไอเท็มนี้มาจาก addon นี้"
     : "ไอเท็มนี้ไม่ใช่ addon นี้ แต่จะหายไปถ้าทับ";
   const form = new MessageFormData()
@@ -908,8 +989,8 @@ async function showOverwriteMenu(player, armor, slot, existing, itemId) {
     .button2("ยกเลิก");
   const response = await form.show(player);
   if (response.canceled || response.selection !== 0) return;
-  if (!canStackArmor(player)) await clearAllAddonArmorFromOtherSlots(player, slot);
-  const ok = await replaceArmor(player, slot, itemId);
+  if (slot.isArmor !== false && !canStackArmor(player)) await clearAllAddonArmorFromOtherSlots(player, slot);
+  const ok = await replaceEquipment(player, slot, itemId);
   player.sendMessage(ok ? `§aทับไอเท็มเดิมและใส่ ${armor.name} ที่ช่อง${slot.label}แล้ว` : "§cใส่ไอเท็มไม่สำเร็จ");
 }
 
@@ -925,7 +1006,6 @@ world.afterEvents.itemUse.subscribe((event) => {
 });
 """
     return script.replace("__CONFIG_JSON__", data)
-
 
 def _lang_label(display_name: str, slot_key: str) -> str:
     slot_th = next((label for key, label, *_ in SLOTS if key == slot_key), slot_key)
@@ -1032,7 +1112,9 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
 
     for idx, candidate in enumerate(selected, start=1):
         orig_ns, orig_name = _identifier_parts(candidate.identifier)
-        base = f"armor_{idx:03d}_{orig_ns}_{orig_name}"
+        item_kind = getattr(candidate, "item_kind", "wearable")
+        base_prefix = "offhand" if item_kind == "offhand" else "armor"
+        base = f"{base_prefix}_{idx:03d}_{orig_ns}_{orig_name}"
         new_ns = _safe_id(f"{safe_addon}_{idx:03d}", "autoarmor")
         item_path = root / candidate.file_path
         try:
@@ -1040,7 +1122,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
         except Exception:
             item_data = {}
         src_attach = _find_attachable_for_item(src_rp, candidate.identifier, candidate.file_path)
-        if not src_attach:
+        if not src_attach and item_kind != "offhand":
             warnings.append(f"ไม่พบ attachable สำหรับ {candidate.identifier}; จะสร้าง attachable พื้นฐาน")
 
         # Prefer explicit icon texture, fallback to first default attachable texture.
@@ -1062,7 +1144,23 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
             "name": candidate.display_name,
             "icon": icon_ref,
             "items": {},
+            "kind": item_kind,
         }
+
+        if item_kind == "offhand":
+            new_item_name = f"{base}_offhand"
+            new_item_id = f"{new_ns}:{new_item_name}"
+            all_item_ids.append(new_item_id)
+            armor_entry["items"]["offhand"] = new_item_id
+            label = f"{candidate.display_name} (มือซ้าย)"
+            item_json = _make_generated_offhand_item(item_data, new_item_id, generated_icon_key, label)
+            _write_json(dst_bp / "items" / f"{new_item_name}.json", item_json)
+            _normalize_attachable_for_item(src_rp, dst_rp, src_attach, new_item_id, base, warnings)
+            lang_lines.append(f"item.{new_item_id}.name={label}")
+            lang_lines.append(f"item.{new_item_name}.name={label}")
+            armors.append(armor_entry)
+            continue
+
         output_slot_keys = _slot_keys_for_candidate(candidate, slot_mode, custom_slots)
         if slot_mode == "original" and candidate.wearable_slot not in SLOT_BY_WEARABLE:
             warnings.append(f"ไม่รู้จัก wearable slot เดิมของ {candidate.identifier}: {candidate.wearable_slot}; fallback เป็นกางเกง")
