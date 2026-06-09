@@ -58,7 +58,7 @@ Auto convert skin ui by SamSoSleepy
 Discord : https://discord.gg/FnmWw7nWyq
 ```
 
-ผลลัพธ์จะมี `NORMALIZE_REPORT.txt` แนบอยู่ใน addon เพื่อดู mapping/warning
+ผลลัพธ์จะไม่มีไฟล์ report `.txt` อยู่ใน pack แล้ว ระบบจะส่งข้อความ report ลง webhook แทน
 
 ## รวมแอดออน 2-5 ไฟล์
 
@@ -79,7 +79,7 @@ Discord : https://discord.gg/FnmWw7nWyq
 - แยก scripts เดิมเป็น `scripts/addon_<prefix>/...`
 - สร้าง main.js ใหม่สำหรับ import script entry ของแต่ละ addon
 - prefix identifiers/geometry/animation/controller/texture เพื่อลดการชนกัน
-- สร้าง `MERGE_REPORT.txt`
+- ไม่ใส่ `MERGE_REPORT.txt` ใน pack แล้ว แต่ส่ง report ลง webhook เป็นข้อความ
 
 ## Environment Variables บน Render
 
@@ -136,7 +136,7 @@ python bot.py
 
 ## หมายเหตุเรื่องความเสถียร
 
-Normalize/Rebuild Mode ลดปัญหา addon โครงสร้างแปลก เพราะไม่แก้ pack เดิมตรง ๆ แต่สร้าง pack ใหม่ตามทรงมาตรฐาน Seraphim อย่างไรก็ตาม addon ที่พึ่ง script เดิมเพื่อคุม animation variable แบบ dynamic อาจต้องทดสอบในเกมและตรวจ `NORMALIZE_REPORT.txt`
+Normalize/Rebuild Mode ลดปัญหา addon โครงสร้างแปลก เพราะไม่แก้ pack เดิมตรง ๆ แต่สร้าง pack ใหม่ตามทรงมาตรฐาน Seraphim อย่างไรก็ตาม addon ที่พึ่ง script เดิมเพื่อคุม animation variable แบบ dynamic อาจต้องทดสอบในเกมและดูข้อความ report ใน webhook
 
 ## Creative inventory visibility update
 
@@ -163,7 +163,10 @@ This avoids the Bedrock issue where hidden custom wearables can remain give-able
 
 - Merge Addons mode keeps generated/merged BP item entries visible in top-level `Equipment`.
 - Combine UI mode keeps wearable target items hidden with `menu_category: { "category": "none" }`; only the UI selector item is visible in `Equipment`.
-- The generated in-game UI now has a top **ตั้งค่า** button.
+- The generated in-game UI now has a top **ตั้งค่า** button using a real modal toggle for “ใส่ซ้อนกันได้”.
   - Default: stacking is off, so equipping another slot removes this addon’s armor from the other slots.
   - When enabled: armor from the same UI can stay equipped on multiple slots at the same time.
+- The generated in-game UI has a red **ถอดออก** button under settings. If only one addon armor piece is equipped it removes immediately; if multiple are equipped it asks which one to remove.
+- The UI selector item uses the output pack icon as its inventory icon and hides its held-hand render with `minecraft:render_offsets`.
 - Uploaded pack icons, copied pack icons, and item icons are automatically downscaled to 128x128 to reduce Discord upload size and avoid `413 Payload Too Large` where possible.
+- UI conversion reuses the same model texture file across generated head/chest/legs/feet variants when they come from the same source item, reducing duplicated texture size.

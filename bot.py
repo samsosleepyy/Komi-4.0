@@ -129,6 +129,26 @@ async def send_webhook_log(
         print(f"Webhook log failed: {exc}")
 
 
+
+
+def _read_webhook_report(work_dir: str | Path | None, filename: str) -> str:
+    if not work_dir:
+        return ""
+    try:
+        path = Path(work_dir) / filename
+        if path.exists() and path.is_file():
+            return path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _fit_embed_text(text: str, limit: int = 3600) -> str:
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit - 40].rstrip() + "\n...ตัดข้อความ report บางส่วน"
+
 async def report_unauthorized_guild(guild: discord.Guild) -> None:
     owner_text = f"Unknown owner\n`{guild.owner_id}`"
     try:
@@ -321,9 +341,13 @@ async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> N
             f"{interaction.user.mention} แปลงเสร็จแล้ว โหมดช่อง: **{mode_label}** มีเวลาดาวน์โหลด 1 นาทีก่อนช่องจะถูกลบ",
             file=discord.File(converted_path),
         )
+        report_text = _read_webhook_report(work_dir, "NORMALIZE_REPORT_WEBHOOK.txt")
+        webhook_description = "แปลง addon เป็น UI สำเร็จ"
+        if report_text:
+            webhook_description += "\n\nReport:\n```text\n" + _fit_embed_text(report_text, 3200) + "\n```"
         await send_webhook_log(
             title="Addon UI Converted",
-            description="แปลง addon เป็น UI สำเร็จ",
+            description=webhook_description,
             color=0x57F287,
             fields=[
                 ("User", f"{interaction.user}\n`{interaction.user.id}`", False),
@@ -716,9 +740,13 @@ async def run_merge_job(channel: discord.TextChannel, user: discord.abc.User, st
         merged_path = Path(merged)
         await channel.send(f"{user.mention} รวมแอดออนเสร็จแล้ว มีเวลาดาวน์โหลด 1 นาทีก่อนช่องจะถูกลบ", file=discord.File(merged_path))
         guild = channel.guild if isinstance(channel, discord.TextChannel) else None
+        report_text = _read_webhook_report(state.get("work_dir"), "MERGE_REPORT_WEBHOOK.txt")
+        webhook_description = f"รวม addon {len(source_files)} ไฟล์สำเร็จ"
+        if report_text:
+            webhook_description += "\n\nReport:\n```text\n" + _fit_embed_text(report_text, 3200) + "\n```"
         await send_webhook_log(
             title="Addons Merged",
-            description=f"รวม addon {len(source_files)} ไฟล์สำเร็จ",
+            description=webhook_description,
             color=0x57F287,
             fields=[
                 ("User", f"{user}\n`{user.id}`", False),
