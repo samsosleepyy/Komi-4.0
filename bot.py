@@ -38,6 +38,9 @@ def resize_discord_icon(src: Path, dst: Path, size: int = ICON_SIZE) -> None:
     try:
         with Image.open(src) as img:
             img = img.convert("RGBA")
+            if img.width <= size and img.height <= size:
+                img.save(dst, optimize=True)
+                return
             img.thumbnail((size, size), Image.Resampling.LANCZOS)
             canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
             canvas.paste(img, ((size - img.width) // 2, (size - img.height) // 2))
@@ -292,6 +295,16 @@ class ItemReviewSelect(discord.ui.Select):
         state.pop("slot_mode", None)
         state.pop("custom_slots", None)
 
+        candidates = list(state.get("inspection") or [])
+        selected_candidates = [c for c in candidates if c.get("identifier") in selected_ids]
+        has_wearable = any((c.get("item_kind") or "wearable") != "offhand" for c in selected_candidates)
+        if selected_candidates and not has_wearable:
+            state["slot_mode"] = "original"
+            state["custom_slots"] = []
+            await interaction.response.defer(thinking=True)
+            await run_ui_convert_job(interaction, state)
+            return
+
         selected_text = "\n".join(f"• `{x}`" for x in selected_ids[:12])
         if len(selected_ids) > 12:
             selected_text += f"\n-# และอีก {len(selected_ids)-12} รายการ"
@@ -302,6 +315,7 @@ class ItemReviewSelect(discord.ui.Select):
                 "**1. คงช่องเดิม** — รวมเข้า UI อย่างเดียว ตอนกดเลือกไอเท็มจะใส่ช่องเดิมทันที ไม่ถามช่อง\n"
                 "**2. ใส่ได้ทุกช่อง** — สร้างไอเท็มครบ หัว/ตัว/กางเกง/รองเท้า แล้วถามช่องตอนใช้ UI\n"
                 "**3. กำหนดช่องเอง** — เลือกช่องที่จะให้ใส่ได้ สามารถเลือกได้มากกว่า 1 ช่อง\n\n"
+                "ถ้าในรายการมีไอเท็มที่เปิด `minecraft:allow_off_hand` ระบบจะใส่เป็นมือซ้ายโดยตรง ไม่ถามช่องในเกม\n\n"
                 f"**ไอเท็มที่เลือก:**\n{selected_text}"
             ),
             color=discord.Color.blurple(),
@@ -534,7 +548,10 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
             fields=[("User", f"{message.author}\n`{message.author.id}`", False), ("Guild", f"{message.guild.name if message.guild else 'DM'}\n`{message.guild.id if message.guild else 'DM'}`", False), ("File", attachment.filename, True), ("Detected Items", str(len(candidates)), True)],
             files=[source_file],
         )
-        desc = "\n".join(f"`{i+1}.` **{c['display_name']}** - `{c['file_path']}`" for i, c in enumerate(candidates[:25]))
+        desc = "\n".join(
+            f"`{i+1}.` **{c['display_name']}** - `{c.get('wearable_slot') or ('มือซ้าย' if c.get('item_kind') == 'offhand' else 'ไม่ระบุ')}`\n-# {c['file_path']}"
+            for i, c in enumerate(candidates[:25])
+        )
         if len(candidates) > 25:
             desc += f"\n\nพบ {len(candidates)} ไอเท็ม แต่ Discord dropdown แสดงได้ครั้งละ 25 ตัวเลือก ตอนนี้แสดง 25 รายการแรก"
         embed = discord.Embed(title="📄 Review Mode: เลือกไอเท็มที่จะรวมเข้า UI", description=desc or "ไม่พบรายการ", color=discord.Color.green())
@@ -694,7 +711,7 @@ class MergePreviewView(discord.ui.View):
         state["awaiting_merge_icon"] = True
         if isinstance(interaction.channel, discord.TextChannel):
             await _update_merge_preview_message(interaction.channel, state, disabled=True)
-        await interaction.response.send_message("อัปโหลดรูป pack icon ในช่องนี้ได้เลย ระบบจะย่อเป็น `.png` ขนาด 128x128 อัตโนมัติ", ephemeral=False)
+        await interaction.response.send_message("อัปโหลดรูป pack icon ในช่องนี้ได้เลย ระบบจะย่อรูปที่ใหญ่กว่า 128x128 เป็น `.png` อัตโนมัติ และจะไม่ขยายรูปที่เล็กกว่า 128", ephemeral=False)
 
     @discord.ui.button(label="เริ่มสร้าง", style=discord.ButtonStyle.success, emoji="📦")
     async def start_build(self, interaction: discord.Interaction, button: discord.ui.Button):
