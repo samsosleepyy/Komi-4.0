@@ -331,6 +331,9 @@ def _copy_pack_files(src_root: Path, dst_root: Path, prefix: str, mapping: Dict[
         rel = path.relative_to(src_root)
         if rel.name == 'manifest.json':
             continue
+        # Do not include TXT notes/reports inside generated packs; reports are sent to webhook text instead.
+        if rel.suffix.lower() == '.txt':
+            continue
         # Generated files are merged separately.
         if not is_bp and rel.parts and rel.parts[0] == 'textures':
             # Texture images and item_texture.json are merged separately so paths/keys can be prefixed safely.
@@ -775,7 +778,7 @@ def merge_addons(addon_paths: List[str], work_dir: str, pack_name: Optional[str]
         'Warnings:',
         *(warnings or ['- No major warnings detected.']),
     ]
-    (merged / 'MERGE_REPORT.txt').write_text('\n'.join(report_lines) + '\n', encoding='utf-8')
+    (work / 'MERGE_REPORT_WEBHOOK.txt').write_text('\n'.join(report_lines) + '\n', encoding='utf-8')
 
     out_path = work / 'merged_addons.mcaddon'
     if out_path.exists():

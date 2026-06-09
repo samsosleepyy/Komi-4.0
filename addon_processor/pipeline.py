@@ -517,7 +517,7 @@ def _normalize_attachable_for_slot(src_rp: Path, dst_rp: Path, src_attach: Optio
     if isinstance(textures, dict):
         for key, value in list(textures.items()):
             if isinstance(value, str) and value.startswith("textures/") and "enchanted" not in value:
-                textures[key] = _copy_texture_between(src_rp, dst_rp, value, f"textures/models/armor/{base}_{slot_key}_{_safe_id(key, 'tex')}", warnings)
+                textures[key] = _copy_texture_between(src_rp, dst_rp, value, f"textures/models/armor/{base}_{_safe_id(key, 'tex')}", warnings)
     else:
         desc["textures"] = {}
 
@@ -630,6 +630,24 @@ def _copy_pack_icon(src_bp: Path, src_rp: Path, dst_bp: Path, dst_rp: Path) -> N
             return
 
 
+def _prepare_selector_pack_icon(dst_bp: Path, dst_rp: Path, warnings: List[str]) -> Optional[Tuple[str, str]]:
+    """Use the output pack icon as the visible inventory icon for the UI item.
+
+    The held item model is hidden separately with render_offsets, but the atlas
+    icon remains visible in inventory/Equipment.
+    """
+    src = dst_rp / "pack_icon.png"
+    if not src.exists():
+        src = dst_bp / "pack_icon.png"
+    if not src.exists():
+        warnings.append("ไม่พบ pack_icon.png สำหรับใช้เป็น icon ของไอเท็ม UI; fallback เป็น icon ไอเท็มแรก")
+        return None
+    icon_key = "auto_ui_pack_icon"
+    icon_ref = "textures/item/auto_ui_pack_icon"
+    _write_resized_icon(src, dst_rp / "textures" / "item" / "auto_ui_pack_icon.png")
+    return icon_key, icon_ref
+
+
 def _generate_ui_script(selector_id: str, armors: List[Dict[str, Any]], all_item_ids: List[str], selector_display_name: str) -> str:
     data = json.dumps({
         "menuItem": selector_id,
@@ -638,7 +656,7 @@ def _generate_ui_script(selector_id: str, armors: List[Dict[str, Any]], all_item
         "allItems": all_item_ids,
     }, ensure_ascii=False, indent=2)
     script = r"""import { world, system, EquipmentSlot, ItemStack } from "@minecraft/server";
-import { ActionFormData, MessageFormData } from "@minecraft/server-ui";
+import { ActionFormData, MessageFormData, ModalFormData } from "@minecraft/server-ui";
 
 const CONFIG = __CONFIG_JSON__;
 const SLOTS = [
@@ -649,6 +667,13 @@ const SLOTS = [
 ];
 const SLOT_BY_KEY = new Map(SLOTS.map((slot) => [slot.key, slot]));
 const ALL_ADDON_ARMOR_ITEMS = new Set(CONFIG.allItems);
+const ITEM_INFO = new Map();
+for (const armor of CONFIG.armors) {
+  for (const [slotKey, itemId] of Object.entries(armor.items || {})) {
+    const slot = SLOT_BY_KEY.get(slotKey);
+    if (itemId && slot) ITEM_INFO.set(itemId, { armor, slot, slotKey });
+  }
+}
 
 function getAvailableSlots(armor) {
   const keys = Object.keys(armor.items || {}).filter((key) => armor.items[key] && SLOT_BY_KEY.has(key));
@@ -762,7 +787,8 @@ async function showArmorMenu(player) {
   const form = new ActionFormData()
     .title(CONFIG.uiTitle || "รวมไอเท็มใส่ UI")
     .body(`§eเลือกไอเท็มที่ต้องการใส่\n§7ใส่ซ้อนกัน: ${stackStatus}\n\n§b§lAuto convert skin ui§r §7by §eSamSoSleepy\n§9Discord : §ahttps://discord.gg/FnmWw7nWyq`);
-  form.button("⚙️ ตั้งค่า");
+  form.button("ตั้งค่า");
+  form.button("§cถอดออก");
   for (const armor of CONFIG.armors) form.button(armor.name, armor.icon || undefined);
   const response = await form.show(player);
   if (response.canceled || response.selection === undefined) return;
@@ -770,7 +796,11 @@ async function showArmorMenu(player) {
     await showSettingsMenu(player);
     return;
   }
-  const armor = CONFIG.armors[response.selection - 1];
+  if (response.selection === 1) {
+    await showRemoveMenu(player);
+    return;
+  }
+  const armor = CONFIG.armors[response.selection - 2];
   if (!armor) return;
   const availableSlots = getAvailableSlots(armor);
   if (availableSlots.length === 1) {
@@ -782,24 +812,58 @@ async function showArmorMenu(player) {
 
 async function showSettingsMenu(player) {
   const enabled = canStackArmor(player);
-  const form = new ActionFormData()
-    .title("⚙️ ตั้งค่า")
-    .body(
-      "เปิด/ปิดการใส่ซ้อนกันได้\n\n" +
-      "§7ปิด: ใส่ช่องใหม่แล้วไอเท็มจาก addon นี้ในช่องอื่นจะถูกถอดออก\n" +
-      "§7เปิด: ใส่หลายช่องพร้อมกันได้ เช่น หัว+ตัว+ขา+เท้า"
-    )
-    .button(enabled ? "ปิดการใส่ซ้อนกัน" : "เปิดการใส่ซ้อนกัน")
-    .button("กลับ");
+  const form = new ModalFormData()
+    .title("ตั้งค่า")
+    .toggle("ใส่ซ้อนกันได้", enabled);
   const response = await form.show(player);
-  if (response.canceled || response.selection === undefined) return;
-  if (response.selection === 0) {
-    setCanStackArmor(player, !enabled);
-    player.sendMessage(!enabled ? "§aเปิดการใส่ซ้อนกันแล้ว" : "§eปิดการใส่ซ้อนกันแล้ว");
+  if (response.canceled) {
     await showArmorMenu(player);
     return;
   }
+  const nextValue = !!(response.formValues && response.formValues[0]);
+  setCanStackArmor(player, nextValue);
+  player.sendMessage(nextValue ? "§aเปิดการใส่ซ้อนกันแล้ว" : "§eปิดการใส่ซ้อนกันแล้ว");
   await showArmorMenu(player);
+}
+
+function getEquippedAddonArmors(player) {
+  const equipped = [];
+  for (const slot of SLOTS) {
+    const item = getEquippedItem(player, slot);
+    if (!isAddonArmor(item)) continue;
+    equipped.push({ slot, item, info: ITEM_INFO.get(item.typeId) });
+  }
+  return equipped;
+}
+
+async function removeEquippedArmor(player, entry) {
+  if (!entry || !entry.slot) return;
+  const ok = await clearArmorSlot(player, entry.slot);
+  if (entry.item) purgeFromInventory(player, entry.item.typeId);
+  const label = entry.info && entry.info.armor ? entry.info.armor.name : (entry.item ? entry.item.typeId : "ไอเท็ม");
+  player.sendMessage(ok ? `§aถอด ${label} จากช่อง${entry.slot.label}แล้ว` : "§cถอดไอเท็มไม่สำเร็จ");
+}
+
+async function showRemoveMenu(player) {
+  const equipped = getEquippedAddonArmors(player);
+  if (!equipped.length) {
+    player.sendMessage("§eตอนนี้ไม่ได้ใส่เกราะของ addon นี้อยู่");
+    return;
+  }
+  if (equipped.length === 1) {
+    await removeEquippedArmor(player, equipped[0]);
+    return;
+  }
+  const form = new ActionFormData()
+    .title("ถอดออก")
+    .body("เลือกเกราะของ addon นี้ที่ต้องการถอด");
+  for (const entry of equipped) {
+    const name = entry.info && entry.info.armor ? entry.info.armor.name : entry.item.typeId;
+    form.button(`§c${name} (${entry.slot.label})`);
+  }
+  const response = await form.show(player);
+  if (response.canceled || response.selection === undefined) return;
+  await removeEquippedArmor(player, equipped[response.selection]);
 }
 
 async function showSlotMenu(player, armor, availableSlots) {
@@ -960,6 +1024,11 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
     lang_lines: List[str] = [f"item.{selector_id}.name={selector_display_name}"]
     warnings: List[str] = []
     texture_data: Dict[str, Any] = {}
+    selector_icon_key: Optional[str] = None
+    selector_pack_icon = _prepare_selector_pack_icon(dst_bp, dst_rp, warnings)
+    if selector_pack_icon:
+        selector_icon_key, selector_icon_ref = selector_pack_icon
+        texture_data[selector_icon_key] = {"textures": selector_icon_ref}
 
     for idx, candidate in enumerate(selected, start=1):
         orig_ns, orig_name = _identifier_parts(candidate.identifier)
@@ -1019,10 +1088,20 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
                 "menu_category": {"category": "equipment"},
             },
             "components": {
-                "minecraft:icon": next(iter(texture_data.keys()), "diamond"),
+                "minecraft:icon": selector_icon_key or next(iter(texture_data.keys()), "diamond"),
                 "minecraft:display_name": {"value": selector_display_name},
                 "minecraft:max_stack_size": 1,
                 "minecraft:allow_off_hand": True,
+                "minecraft:render_offsets": {
+                    "main_hand": {
+                        "first_person": {"scale": [0.0, 0.0, 0.0]},
+                        "third_person": {"scale": [0.0, 0.0, 0.0]},
+                    },
+                    "off_hand": {
+                        "first_person": {"scale": [0.0, 0.0, 0.0]},
+                        "third_person": {"scale": [0.0, 0.0, 0.0]},
+                    },
+                },
             },
         },
     }
@@ -1061,7 +1140,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
     if warnings:
         report.extend(["", "Warnings:"])
         report.extend(f"- {w}" for w in warnings)
-    (out_root / "NORMALIZE_REPORT.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
+    (Path(work_dir) / "NORMALIZE_REPORT_WEBHOOK.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
 
     output_stem = src.stem
     if output_stem.lower().endswith(".mcaddon"):
