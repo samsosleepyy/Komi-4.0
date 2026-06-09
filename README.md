@@ -158,3 +158,12 @@ Hidden wearable items use `menu_category: { "category": "none" }` like Eldoria.
 The generated UI now equips those hidden items through the Script API first:
 `equippable.setEquipment(slot, new ItemStack(itemId, 1))`, then falls back to `/replaceitem` only if the API path fails.
 This avoids the Bedrock issue where hidden custom wearables can remain give-able but fail when inserted by command.
+
+## Update: slot stacking setting and image downsizing
+
+- Merge Addons mode keeps generated/merged BP item entries visible in top-level `Equipment`.
+- Combine UI mode keeps wearable target items hidden with `menu_category: { "category": "none" }`; only the UI selector item is visible in `Equipment`.
+- The generated in-game UI now has a top **ตั้งค่า** button.
+  - Default: stacking is off, so equipping another slot removes this addon’s armor from the other slots.
+  - When enabled: armor from the same UI can stay equipped on multiple slots at the same time.
+- Uploaded pack icons, copied pack icons, and item icons are automatically downscaled to 128x128 to reduce Discord upload size and avoid `413 Payload Too Large` where possible.

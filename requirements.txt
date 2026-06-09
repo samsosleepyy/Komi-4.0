@@ -2,3 +2,4 @@ discord.py==2.4.0
 aiohttp==3.9.5
 python-dotenv==1.0.1
 audioop-lts==0.2.2; python_version >= '3.13'
+Pillow==10.4.0

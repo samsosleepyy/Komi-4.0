@@ -12,6 +12,11 @@ from typing import Dict, Optional, Set
 import aiohttp
 from aiohttp import web
 import discord
+
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 from discord import app_commands
 from discord.ext import commands
 
@@ -21,6 +26,25 @@ ROOT = Path(__file__).parent
 TEMP_ROOT = ROOT / "temp"
 PANELS_FILE = ROOT / "panels.json"
 TEMP_ROOT.mkdir(exist_ok=True)
+
+ICON_SIZE = 128
+
+
+def resize_discord_icon(src: Path, dst: Path, size: int = ICON_SIZE) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if Image is None:
+        shutil.copy2(src, dst)
+        return
+    try:
+        with Image.open(src) as img:
+            img = img.convert("RGBA")
+            img.thumbnail((size, size), Image.Resampling.LANCZOS)
+            canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            canvas.paste(img, ((size - img.width) // 2, (size - img.height) // 2))
+            canvas.save(dst, optimize=True)
+    except Exception:
+        shutil.copy2(src, dst)
+
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
@@ -439,9 +463,9 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
         description=(
             "เลือกโหมดจาก dropdown ด้านล่าง\n\n"
             "🎨 **รวมไอเท็มเป็น UI**\n"
-            "แปลง addon ที่มีไอเท็มเกราะหลายอันให้เหลือไอเท็ม UI อันเดียว เลือกได้ว่าจะคงช่องเดิม/ใส่ทุกช่อง/กำหนดช่องเอง และใช้ Eldoria-style Script API ใส่เกราะ\n\n"
+            "แปลง addon ที่มีไอเท็มเกราะหลายอันให้เหลือไอเท็ม UI อันเดียว เลือกได้ว่าจะคงช่องเดิม/ใส่ทุกช่อง/กำหนดช่องเอง มีปุ่มตั้งค่าเปิด/ปิดใส่ซ้อน และใช้ Eldoria-style Script API ใส่เกราะ\n\n"
             "📦 **รวมแอดออน**\n"
-            "รวม addon ได้ 2-5 ไฟล์เป็น addon เดียว สุ่ม UUID ใหม่ แยก scripts เป็น `scripts/addon_*` กันชื่อไฟล์/identifier/geometry/animation/texture ชน และสร้าง `MERGE_REPORT.txt` ให้ตรวจสอบ\n\n"
+            "รวม addon ได้ 2-5 ไฟล์เป็น addon เดียว สุ่ม UUID ใหม่ แยก scripts เป็น `scripts/addon_*` กันชื่อไฟล์/identifier/geometry/animation/texture ชน วาง item ใน Equipment และสร้าง `MERGE_REPORT.txt` ให้ตรวจสอบ\n\n"
             "หลังเลือกโหมด บอทจะสร้าง ticket ส่วนตัวให้อัปโหลดไฟล์"
         ),
         color=discord.Color.blurple(),
@@ -646,7 +670,7 @@ class MergePreviewView(discord.ui.View):
         state["awaiting_merge_icon"] = True
         if isinstance(interaction.channel, discord.TextChannel):
             await _update_merge_preview_message(interaction.channel, state, disabled=True)
-        await interaction.response.send_message("อัปโหลดรูป pack icon ในช่องนี้ได้เลย แนะนำใช้ไฟล์ `.png` ขนาด 256x256", ephemeral=False)
+        await interaction.response.send_message("อัปโหลดรูป pack icon ในช่องนี้ได้เลย ระบบจะย่อเป็น `.png` ขนาด 128x128 อัตโนมัติ", ephemeral=False)
 
     @discord.ui.button(label="เริ่มสร้าง", style=discord.ButtonStyle.success, emoji="📦")
     async def start_build(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -732,9 +756,10 @@ async def handle_merge_icon_message(message: discord.Message, state: dict) -> bo
         return True
     image = images[0]
     job_dir = Path(state["work_dir"])
-    suffix = Path(image.filename).suffix.lower()
-    icon_path = job_dir / f"custom_pack_icon{suffix}"
-    await image.save(icon_path)
+    raw_icon_path = job_dir / f"uploaded_pack_icon{Path(image.filename).suffix.lower()}"
+    icon_path = job_dir / "custom_pack_icon.png"
+    await image.save(raw_icon_path)
+    await asyncio.to_thread(resize_discord_icon, raw_icon_path, icon_path)
     state["merge_pack_icon_path"] = str(icon_path)
     state["merge_icon_url"] = image.url
     state["awaiting_merge_icon"] = False
