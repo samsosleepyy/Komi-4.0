@@ -244,18 +244,47 @@ def _cleanup_work_dir(path: str | Path | None) -> None:
         print(f"Failed cleaning temp folder {path}: {exc}")
 
 
-async def schedule_delete(channel: discord.TextChannel, delay: int, *, channel_id: Optional[int] = None, work_dir: str | Path | None = None) -> None:
+async def schedule_delete(
+    channel: discord.TextChannel,
+    delay: int,
+    *,
+    channel_id: Optional[int] = None,
+    work_dir: str | Path | None = None,
+    generation: Optional[int] = None,
+) -> None:
+    """Delete a temporary ticket only if this is still the active timer.
+
+    Important: a cancelled timer must not pop TICKETS or delete temp files. The
+    previous patch reset timers by cancelling the old task, but the old task
+    still ran its finally block and removed the ticket state. That made the next
+    dropdown/button interaction answer "ticket หมดอายุแล้ว" immediately and also
+    broke the merge workflow after the first upload.
+    """
+    should_cleanup = False
     try:
         await asyncio.sleep(delay)
+        if channel_id is not None and generation is not None:
+            current_state = TICKETS.get(channel_id)
+            if not current_state or current_state.get("timer_generation") != generation:
+                return
         await channel.delete(reason="Temporary addon ticket expired")
+        should_cleanup = True
     except asyncio.CancelledError:
+        # Normal path when the user uploads/selects something and the ticket TTL
+        # is extended. Do not touch TICKETS or temp folders here.
         return
     except discord.NotFound:
-        pass
+        should_cleanup = True
     except Exception as exc:
         print(f"Failed deleting channel: {exc}")
+        return
     finally:
+        if not should_cleanup:
+            return
         if channel_id is not None:
+            state = TICKETS.get(channel_id)
+            if generation is not None and state and state.get("timer_generation") != generation:
+                return
             state = TICKETS.pop(channel_id, None)
             if state:
                 _cleanup_work_dir(work_dir or state.get("work_dir"))
@@ -267,7 +296,11 @@ def reset_ticket_timer(channel: discord.TextChannel, state: dict, delay: int) ->
     old_task = state.get("delete_task")
     if old_task and not old_task.done():
         old_task.cancel()
-    state["delete_task"] = asyncio.create_task(schedule_delete(channel, delay, channel_id=channel.id, work_dir=state.get("work_dir")))
+    generation = int(state.get("timer_generation") or 0) + 1
+    state["timer_generation"] = generation
+    state["delete_task"] = asyncio.create_task(
+        schedule_delete(channel, delay, channel_id=channel.id, work_dir=state.get("work_dir"), generation=generation)
+    )
 
 
 def mode_label(mode: str) -> str:
@@ -305,11 +338,13 @@ async def create_ticket(interaction: discord.Interaction, mode: str) -> None:
         await interaction.response.send_message(f"สร้างช่องไม่สำเร็จ: {exc}", ephemeral=True)
         return
 
-    task = asyncio.create_task(schedule_delete(channel, INITIAL_TICKET_TTL, channel_id=channel.id))
+    timer_generation = 1
+    task = asyncio.create_task(schedule_delete(channel, INITIAL_TICKET_TTL, channel_id=channel.id, generation=timer_generation))
     TICKETS[channel.id] = {
         "mode": mode,
         "user_id": interaction.user.id,
         "delete_task": task,
+        "timer_generation": timer_generation,
         "work_dir": None,
         "source_file": None,
         "source_files": [],
