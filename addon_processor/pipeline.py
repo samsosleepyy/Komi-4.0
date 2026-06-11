@@ -54,6 +54,10 @@ def _slot_keys_for_candidate(candidate: "AddonItemCandidate", slot_mode: str = "
 
 TEXTURE_EXTS = (".png", ".tga", ".jpg", ".jpeg", ".webp")
 ICON_SIZE = 128
+MAX_ZIP_MEMBERS = int(os.getenv("MAX_ZIP_MEMBERS", "3000"))
+MAX_ZIP_UNCOMPRESSED_BYTES = int(os.getenv("MAX_ZIP_UNCOMPRESSED_BYTES", str(250 * 1024 * 1024)))
+MAX_ZIP_SINGLE_FILE_BYTES = int(os.getenv("MAX_ZIP_SINGLE_FILE_BYTES", str(80 * 1024 * 1024)))
+MAX_ZIP_MEMBER_NAME_LENGTH = int(os.getenv("MAX_ZIP_MEMBER_NAME_LENGTH", "240"))
 
 
 def _resize_image_file(path: Path, size: int = ICON_SIZE) -> bool:
@@ -161,12 +165,28 @@ def _write_json(path: Path, data: Any) -> None:
 
 def _safe_extract(zip_path: Path, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+    out_root = out_dir.resolve()
     with zipfile.ZipFile(zip_path, "r") as zf:
-        for info in zf.infolist():
+        infos = zf.infolist()
+        if len(infos) > MAX_ZIP_MEMBERS:
+            raise AddonError(f"ไฟล์ zip มีจำนวนไฟล์มากเกินไป ({len(infos)} / สูงสุด {MAX_ZIP_MEMBERS})")
+        total_uncompressed = 0
+        for info in infos:
             member = Path(info.filename)
+            if not info.filename or len(info.filename) > MAX_ZIP_MEMBER_NAME_LENGTH:
+                raise AddonError(f"ชื่อไฟล์ใน zip ยาวหรือว่างผิดปกติ: {info.filename[:120]}")
             if info.filename.startswith("/") or ".." in member.parts:
                 raise AddonError(f"Unsafe zip member: {info.filename}")
+            if info.file_size > MAX_ZIP_SINGLE_FILE_BYTES:
+                raise AddonError(f"ไฟล์ภายใน zip ใหญ่เกินกำหนด: {info.filename} ({info.file_size} bytes)")
+            total_uncompressed += int(info.file_size or 0)
+            if total_uncompressed > MAX_ZIP_UNCOMPRESSED_BYTES:
+                raise AddonError(f"ขนาดหลังแตก zip ใหญ่เกินกำหนด ({total_uncompressed} bytes / สูงสุด {MAX_ZIP_UNCOMPRESSED_BYTES} bytes)")
             target = out_dir / info.filename
+            try:
+                target.resolve().relative_to(out_root)
+            except Exception:
+                raise AddonError(f"Unsafe zip member: {info.filename}")
             if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
             else:
@@ -190,9 +210,9 @@ def _find_packs(root: Path) -> Tuple[Path, Path]:
         if "resources" in types and rp is None:
             rp = manifest_path.parent
     if bp is None:
-        raise AddonError("ไม่พบ Behavior Pack manifest ที่มี module type=data")
+        raise AddonError("ไม่พบ Behavior Pack manifest ที่มี module type=data (ไฟล์อาจเป็น Resource Pack/texture pack อย่างเดียว หรือ manifest ระบุ module ไม่ถูกต้อง)")
     if rp is None:
-        raise AddonError("ไม่พบ Resource Pack manifest ที่มี module type=resources")
+        raise AddonError("ไม่พบ Resource Pack manifest ที่มี module type=resources (ไฟล์อาจไม่มี Resource Pack หรือ manifest ระบุ module ไม่ถูกต้อง)")
     return bp, rp
 
 
