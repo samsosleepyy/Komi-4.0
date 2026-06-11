@@ -10,8 +10,9 @@
 - Panel เป็น dropdown:
   - 🎨 รวมไอเท็มเป็น UI
   - 📦 รวมแอดออน
-- Ticket channel ส่วนตัวชั่วคราว
+- Ticket channel ส่วนตัวชั่วคราว พร้อม cleanup temp folder หลังจบงาน/หมดเวลา
 - ส่ง log และไฟล์ไป webhook
+- จำกัดขนาดไฟล์อัปโหลดและตรวจ zip ก่อนแตกไฟล์ เพื่อลดความเสี่ยง zip bomb / disk เต็ม
 - ไม่มีระบบ point ตามที่ขอ
 
 ## รวมไอเท็มเป็น UI: Normalize/Rebuild Mode
@@ -19,7 +20,7 @@
 เวอร์ชันนี้ใช้แนวคิดจากโครงสร้าง Seraphim template ที่แปลง UI ได้เสถียร ไม่ patch addon เดิมโดยตรง แต่จะ:
 
 1. แตก addon ต้นฉบับ
-2. ตรวจหา `BP/items/*.json` ที่มี `minecraft:wearable`
+2. ตรวจหา Behavior Pack manifest ที่มี module `type: data` แล้วอ่าน `BP/items/*.json` ที่มี `minecraft:wearable` หรือ `minecraft:allow_off_hand`
 3. ให้ผู้ใช้เลือก item ผ่าน Review dropdown
 4. หลังเลือก item แล้ว บอทจะแสดงขั้นตอนเลือกช่องสวมใส่:
    - คงไอเท็มใส่ช่องเดิมและช่องเดียว: รวมเข้า UI อย่างเดียว และตอนกดใช้จะใส่ทันทีโดยไม่ถามช่อง
@@ -88,6 +89,23 @@ DISCORD_TOKEN=token ของบอท
 WEBHOOK_URL=webhook สำหรับ log
 ALLOWED_GUILDS=1420339720277463112,1441795602550882334
 MAX_PARALLEL_JOBS=1
+
+# ปกติไม่จำเป็นต้องเปิด Server Members Intent
+ENABLE_MEMBER_INTENT=0
+
+# Upload / zip safety limits
+MAX_UPLOAD_BYTES=52428800
+MAX_MERGE_TOTAL_UPLOAD_BYTES=157286400
+MAX_ZIP_MEMBERS=3000
+MAX_ZIP_UNCOMPRESSED_BYTES=262144000
+MAX_ZIP_SINGLE_FILE_BYTES=83886080
+MAX_ZIP_MEMBER_NAME_LENGTH=240
+
+# Ticket cleanup
+INITIAL_TICKET_TTL=180
+ACTIVE_TICKET_TTL=900
+FINISHED_TICKET_TTL=60
+STALE_TICKET_CLEANUP_MINUTES=30
 ```
 
 ถ้า webhook URL เคยหลุดหรือเคยส่งในแชท ให้ rotate webhook ก่อนใช้จริง
@@ -112,10 +130,10 @@ python bot.py
 
 ## Discord Developer Portal
 
-เปิด intents ที่แนะนำ:
+เปิด intents ที่จำเป็น/แนะนำ:
 
-- Server Members Intent
-- Message Content Intent
+- Message Content Intent: จำเป็น เพราะบอทต้องอ่านไฟล์แนบที่ผู้ใช้อัปโหลดใน ticket
+- Server Members Intent: ไม่จำเป็นในค่าเริ่มต้นของเวอร์ชันนี้ เปิดเฉพาะถ้าตั้ง `ENABLE_MEMBER_INTENT=1` และเพิ่มฟีเจอร์ที่ต้องอ่าน member list จริง ๆ
 
 สิทธิ์บอทที่ควรมี:
 
@@ -137,6 +155,8 @@ python bot.py
 ## หมายเหตุเรื่องความเสถียร
 
 Normalize/Rebuild Mode ลดปัญหา addon โครงสร้างแปลก เพราะไม่แก้ pack เดิมตรง ๆ แต่สร้าง pack ใหม่ตามทรงมาตรฐาน Seraphim อย่างไรก็ตาม addon ที่พึ่ง script เดิมเพื่อคุม animation variable แบบ dynamic อาจต้องทดสอบในเกมและดูข้อความ report ใน webhook
+
+ถ้าเจอข้อความ `ไม่พบ Behavior Pack manifest ที่มี module type=data` ในโหมดรวมไอเท็มเป็น UI แปลว่าไฟล์นั้นไม่มี Behavior Pack ที่บอทอ่าน `BP/items/*.json` ได้ หรือเป็น Resource Pack/texture pack อย่างเดียว กรณีนี้ถือว่าจำเป็นต้องแจ้งผู้ใช้ให้อัปโหลด `.mcaddon` ที่มีทั้ง BP และ RP เพราะโหมด UI ต้องใช้ item definition จาก Behavior Pack เพื่อสร้าง wearable/offhand item ใหม่
 
 ## Creative inventory visibility update
 
@@ -170,3 +190,13 @@ This avoids the Bedrock issue where hidden custom wearables can remain give-able
 - The UI selector item uses the output pack icon as its inventory icon and hides its held-hand render with `minecraft:render_offsets`.
 - Uploaded pack icons, copied pack icons, and item icons are automatically downscaled to 128x128 to reduce Discord upload size and avoid `413 Payload Too Large` where possible.
 - UI conversion reuses the same model texture file across generated head/chest/legs/feet variants when they come from the same source item, reducing duplicated texture size.
+
+
+## Update: safety and ticket cleanup
+
+- เพิ่มตัวแปรจำกัดขนาดไฟล์อัปโหลดต่อไฟล์และรวมทั้งงาน merge
+- `_safe_extract()` ตรวจจำนวนไฟล์ใน zip, ขนาดหลังแตก, ขนาดไฟล์เดี่ยว, path traversal และชื่อไฟล์ที่ยาวผิดปกติ
+- หลังส่งไฟล์สำเร็จหรือ ticket หมดเวลา ระบบจะลบ temp work directory อัตโนมัติ
+- ถ้าผู้ใช้อัปโหลดแล้วไม่กด dropdown/button ต่อ ticket จะถูกลบหลัง `ACTIVE_TICKET_TTL`
+- ถ้าบอท restart แล้วเหลือ ticket channel เก่าที่ state หาย ระบบจะลบ ticket เก่าใน category ที่ตั้งไว้หลังเกิน `STALE_TICKET_CLEANUP_MINUTES`
+- `/setup` แก้ข้อความ merge report ให้ตรงกับพฤติกรรมจริง: report ถูกส่งไป webhook ไม่ได้ฝัง `MERGE_REPORT.txt` ใน pack

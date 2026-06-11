@@ -6,6 +6,7 @@ import os
 import shutil
 import tempfile
 from dataclasses import asdict
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Optional, Set
 
@@ -57,13 +58,19 @@ ALLOWED_GUILDS: Set[int] = {
 MAX_PARALLEL_JOBS = int(os.getenv("MAX_PARALLEL_JOBS", "1"))
 MIN_MERGE_ADDONS = 2
 MAX_MERGE_ADDONS = 5
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+MAX_MERGE_TOTAL_UPLOAD_BYTES = int(os.getenv("MAX_MERGE_TOTAL_UPLOAD_BYTES", str(150 * 1024 * 1024)))
+INITIAL_TICKET_TTL = int(os.getenv("INITIAL_TICKET_TTL", "180"))
+ACTIVE_TICKET_TTL = int(os.getenv("ACTIVE_TICKET_TTL", "900"))
+FINISHED_TICKET_TTL = int(os.getenv("FINISHED_TICKET_TTL", "60"))
+STALE_TICKET_CLEANUP_MINUTES = int(os.getenv("STALE_TICKET_CLEANUP_MINUTES", "30"))
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True
+intents.members = os.getenv("ENABLE_MEMBER_INTENT", "0").lower() in {"1", "true", "yes", "on"}
 intents.messages = True
 intents.message_content = True
 
@@ -181,16 +188,86 @@ async def enforce_guild_allowlist() -> None:
                 print(f"Failed to leave guild {guild.id}: {exc}")
 
 
-async def schedule_delete(channel: discord.TextChannel, delay: int) -> None:
+async def cleanup_stale_ticket_channels() -> None:
+    """Remove old ticket channels left behind by a process restart.
+
+    Ticket progress lives in memory by design. If the bot restarts, old ui-/merge-
+    channels cannot continue safely, so this sweep removes stale channels in the
+    configured ticket categories instead of leaving users in a dead workflow.
+    """
+    if STALE_TICKET_CLEANUP_MINUTES <= 0:
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_TICKET_CLEANUP_MINUTES)
+    panels = load_panels()
+    for guild in list(bot.guilds):
+        if guild.id not in ALLOWED_GUILDS:
+            continue
+        conf = panels.get(str(guild.id), {})
+        category_id = conf.get("category_id")
+        category = guild.get_channel(int(category_id)) if category_id else None
+        if not isinstance(category, discord.CategoryChannel):
+            continue
+        for channel in list(category.text_channels):
+            if channel.id in TICKETS:
+                continue
+            if not (channel.name.startswith("ui-") or channel.name.startswith("merge-")):
+                continue
+            if channel.created_at and channel.created_at > cutoff:
+                continue
+            try:
+                await channel.delete(reason="Cleanup stale addon ticket after bot restart")
+            except Exception as exc:
+                print(f"Failed cleaning stale ticket {channel.id}: {exc}")
+
+
+def _format_bytes(value: int | None) -> str:
+    try:
+        size = float(value or 0)
+    except Exception:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB"]
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _cleanup_work_dir(path: str | Path | None) -> None:
+    if not path:
+        return
+    try:
+        p = Path(path)
+        if p.exists() and TEMP_ROOT in p.resolve().parents:
+            shutil.rmtree(p, ignore_errors=True)
+    except Exception as exc:
+        print(f"Failed cleaning temp folder {path}: {exc}")
+
+
+async def schedule_delete(channel: discord.TextChannel, delay: int, *, channel_id: Optional[int] = None, work_dir: str | Path | None = None) -> None:
     try:
         await asyncio.sleep(delay)
         await channel.delete(reason="Temporary addon ticket expired")
     except asyncio.CancelledError:
         return
     except discord.NotFound:
-        return
+        pass
     except Exception as exc:
         print(f"Failed deleting channel: {exc}")
+    finally:
+        if channel_id is not None:
+            state = TICKETS.pop(channel_id, None)
+            if state:
+                _cleanup_work_dir(work_dir or state.get("work_dir"))
+        else:
+            _cleanup_work_dir(work_dir)
+
+
+def reset_ticket_timer(channel: discord.TextChannel, state: dict, delay: int) -> None:
+    old_task = state.get("delete_task")
+    if old_task and not old_task.done():
+        old_task.cancel()
+    state["delete_task"] = asyncio.create_task(schedule_delete(channel, delay, channel_id=channel.id, work_dir=state.get("work_dir")))
 
 
 def mode_label(mode: str) -> str:
@@ -228,7 +305,7 @@ async def create_ticket(interaction: discord.Interaction, mode: str) -> None:
         await interaction.response.send_message(f"สร้างช่องไม่สำเร็จ: {exc}", ephemeral=True)
         return
 
-    task = asyncio.create_task(schedule_delete(channel, 180))
+    task = asyncio.create_task(schedule_delete(channel, INITIAL_TICKET_TTL, channel_id=channel.id))
     TICKETS[channel.id] = {
         "mode": mode,
         "user_id": interaction.user.id,
@@ -321,6 +398,8 @@ class ItemReviewSelect(discord.ui.Select):
             color=discord.Color.blurple(),
         )
         await interaction.response.send_message(embed=embed, view=SlotModeReviewView(self.ticket_channel_id))
+        if isinstance(interaction.channel, discord.TextChannel):
+            reset_ticket_timer(interaction.channel, state, ACTIVE_TICKET_TTL)
 
 
 class ItemReviewView(discord.ui.View):
@@ -375,12 +454,11 @@ async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> N
     except Exception as exc:
         await interaction.followup.send(f"แปลงไม่สำเร็จ: `{exc}`")
         await send_webhook_log(title="Addon UI Convert Failed", description=str(exc), color=0xED4245, fields=[("User", f"{interaction.user}\n`{interaction.user.id}`", False)])
+        if isinstance(channel, discord.TextChannel):
+            reset_ticket_timer(channel, state, ACTIVE_TICKET_TTL)
         return
-    old_task = state.get("delete_task")
-    if old_task and not old_task.done():
-        old_task.cancel()
     if isinstance(channel, discord.TextChannel):
-        TICKETS[channel.id]["delete_task"] = asyncio.create_task(schedule_delete(channel, 60))
+        reset_ticket_timer(channel, state, FINISHED_TICKET_TTL)
 
 
 class SlotModeSelect(discord.ui.Select):
@@ -426,6 +504,8 @@ class SlotModeSelect(discord.ui.Select):
                 color=discord.Color.blurple(),
             )
             await interaction.response.send_message(embed=embed, view=CustomSlotReviewView(self.ticket_channel_id))
+            if isinstance(interaction.channel, discord.TextChannel):
+                reset_ticket_timer(interaction.channel, state, ACTIVE_TICKET_TTL)
             return
         await interaction.response.defer(thinking=True)
         await run_ui_convert_job(interaction, state)
@@ -468,14 +548,22 @@ class CustomSlotReviewView(discord.ui.View):
         self.add_item(CustomSlotSelect(ticket_channel_id))
 
 
+_COMMANDS_SYNCED = False
+_STALE_TICKETS_CLEANED = False
+
 @bot.event
 async def on_ready():
-    bot.add_view(StartPanelView())
+    global _COMMANDS_SYNCED, _STALE_TICKETS_CLEANED
     await enforce_guild_allowlist()
-    try:
-        await bot.tree.sync()
-    except Exception as exc:
-        print(f"Command sync failed: {exc}")
+    if not _STALE_TICKETS_CLEANED:
+        await cleanup_stale_ticket_channels()
+        _STALE_TICKETS_CLEANED = True
+    if not _COMMANDS_SYNCED:
+        try:
+            await bot.tree.sync()
+            _COMMANDS_SYNCED = True
+        except Exception as exc:
+            print(f"Command sync failed: {exc}")
     print(f"Logged in as {bot.user} ({bot.user.id if bot.user else 'unknown'})")
 
 
@@ -503,7 +591,7 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
             "🎨 **รวมไอเท็มเป็น UI**\n"
             "แปลง addon ที่มีไอเท็มเกราะหลายอันให้เหลือไอเท็ม UI อันเดียว เลือกได้ว่าจะคงช่องเดิม/ใส่ทุกช่อง/กำหนดช่องเอง มีปุ่มตั้งค่าเปิด/ปิดใส่ซ้อน และใช้ Eldoria-style Script API ใส่เกราะ\n\n"
             "📦 **รวมแอดออน**\n"
-            "รวม addon ได้ 2-5 ไฟล์เป็น addon เดียว สุ่ม UUID ใหม่ แยก scripts เป็น `scripts/addon_*` กันชื่อไฟล์/identifier/geometry/animation/texture ชน วาง item ใน Equipment และสร้าง `MERGE_REPORT.txt` ให้ตรวจสอบ\n\n"
+            "รวม addon ได้ 2-5 ไฟล์เป็น addon เดียว สุ่ม UUID ใหม่ แยก scripts เป็น `scripts/addon_*` กันชื่อไฟล์/identifier/geometry/animation/texture ชน วาง item ใน Equipment และส่ง report เข้า webhook ให้ตรวจสอบ\n\n"
             "หลังเลือกโหมด บอทจะสร้าง ticket ส่วนตัวให้อัปโหลดไฟล์"
         ),
         color=discord.Color.blurple(),
@@ -528,9 +616,17 @@ def _valid_addon_attachments(message: discord.Message) -> list[discord.Attachmen
 
 async def handle_combine_ui_message(message: discord.Message, state: dict, attachments: list[discord.Attachment]) -> None:
     attachment = attachments[0]
-    old_task = state.get("delete_task")
-    if old_task and not old_task.done():
-        old_task.cancel()
+    if attachment.size and attachment.size > MAX_UPLOAD_BYTES:
+        await message.channel.send(f"ไฟล์ใหญ่เกินกำหนด ({_format_bytes(attachment.size)} / สูงสุด {_format_bytes(MAX_UPLOAD_BYTES)}) กรุณาลดขนาด addon แล้วอัปโหลดใหม่")
+        if isinstance(message.channel, discord.TextChannel):
+            reset_ticket_timer(message.channel, state, INITIAL_TICKET_TTL)
+        return
+    if isinstance(message.channel, discord.TextChannel):
+        reset_ticket_timer(message.channel, state, ACTIVE_TICKET_TTL)
+    _cleanup_work_dir(state.get("work_dir"))
+    state["work_dir"] = None
+    state["source_file"] = None
+    state["inspection"] = None
     job_dir = Path(tempfile.mkdtemp(prefix=f"addon_ui_{message.author.id}_", dir=TEMP_ROOT))
     source_file = job_dir / attachment.filename
     try:
@@ -556,10 +652,23 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
             desc += f"\n\nพบ {len(candidates)} ไอเท็ม แต่ Discord dropdown แสดงได้ครั้งละ 25 ตัวเลือก ตอนนี้แสดง 25 รายการแรก"
         embed = discord.Embed(title="📄 Review Mode: เลือกไอเท็มที่จะรวมเข้า UI", description=desc or "ไม่พบรายการ", color=discord.Color.green())
         await message.channel.send(embed=embed, view=ItemReviewView(message.channel.id, candidates))
+        if isinstance(message.channel, discord.TextChannel):
+            reset_ticket_timer(message.channel, state, ACTIVE_TICKET_TTL)
     except Exception as exc:
-        await message.channel.send(f"ตรวจสอบ/อ่าน addon ไม่สำเร็จ: `{exc}`")
+        user_message = str(exc)
+        if "ไม่พบ Behavior Pack manifest" in user_message:
+            user_message = (
+                "ไม่พบ Behavior Pack ในไฟล์ที่อัปโหลด หรือ manifest ไม่มี module `type: data`\n"
+                "โหมดรวมไอเท็มเป็น UI จำเป็นต้องมี Behavior Pack เพราะต้องอ่าน `BP/items/*.json` เพื่อหา `minecraft:wearable` หรือ `minecraft:allow_off_hand`\n"
+                "กรุณาอัปโหลดไฟล์ `.mcaddon` ที่มีทั้ง Behavior Pack และ Resource Pack ไม่ใช่ Resource Pack/texture pack อย่างเดียว"
+            )
+        await message.channel.send(f"ตรวจสอบ/อ่าน addon ไม่สำเร็จ:\n```text\n{user_message[:1800]}\n```")
         await send_webhook_log(title="Addon UI Inspect Failed", description=str(exc), color=0xED4245, fields=[("User", f"{message.author}\n`{message.author.id}`", False)], files=[source_file] if source_file.exists() else None)
-        shutil.rmtree(job_dir, ignore_errors=True)
+        _cleanup_work_dir(job_dir)
+        state["work_dir"] = None
+        state["source_file"] = None
+        if isinstance(message.channel, discord.TextChannel):
+            reset_ticket_timer(message.channel, state, INITIAL_TICKET_TTL)
 
 
 
@@ -784,11 +893,9 @@ async def run_merge_job(channel: discord.TextChannel, user: discord.abc.User, st
             fields=[("User", f"{user}\n`{user.id}`", False)],
             files=[Path(p) for p in source_files if Path(p).exists()],
         )
+        reset_ticket_timer(channel, state, ACTIVE_TICKET_TTL)
         return
-    old_task = state.get("delete_task")
-    if old_task and not old_task.done():
-        old_task.cancel()
-    state["delete_task"] = asyncio.create_task(schedule_delete(channel, 60))
+    reset_ticket_timer(channel, state, FINISHED_TICKET_TTL)
 
 
 async def handle_merge_icon_message(message: discord.Message, state: dict) -> bool:
@@ -800,6 +907,9 @@ async def handle_merge_icon_message(message: discord.Message, state: dict) -> bo
             await message.channel.send("กรุณาอัปโหลดไฟล์รูป `.png`, `.jpg`, `.jpeg` หรือ `.webp`")
         return True
     image = images[0]
+    if image.size and image.size > MAX_UPLOAD_BYTES:
+        await message.channel.send(f"รูปใหญ่เกินกำหนด ({_format_bytes(image.size)} / สูงสุด {_format_bytes(MAX_UPLOAD_BYTES)}) กรุณาอัปโหลดรูปที่เล็กลง")
+        return True
     job_dir = Path(state["work_dir"])
     raw_icon_path = job_dir / f"uploaded_pack_icon{Path(image.filename).suffix.lower()}"
     icon_path = job_dir / "custom_pack_icon.png"
@@ -811,6 +921,7 @@ async def handle_merge_icon_message(message: discord.Message, state: dict) -> bo
     await message.channel.send("อัปเดตรูป pack icon แล้ว")
     if isinstance(message.channel, discord.TextChannel):
         await _update_merge_preview_message(message.channel, state)
+        reset_ticket_timer(message.channel, state, ACTIVE_TICKET_TTL)
     return True
 
 
@@ -818,14 +929,28 @@ async def handle_merge_addons_message(message: discord.Message, state: dict, att
     if state.get("merge_running"):
         await message.channel.send("กำลังรวมแอดออนอยู่แล้ว กรุณารอให้เสร็จก่อน")
         return
-    old_task = state.get("delete_task")
-    if old_task and not old_task.done():
-        old_task.cancel()
+    too_large = [a for a in attachments if a.size and a.size > MAX_UPLOAD_BYTES]
+    if too_large:
+        names = ", ".join(f"{a.filename} ({_format_bytes(a.size)})" for a in too_large[:3])
+        await message.channel.send(f"มีไฟล์ใหญ่เกินกำหนดสูงสุด {_format_bytes(MAX_UPLOAD_BYTES)} ต่อไฟล์: {names}")
+        if isinstance(message.channel, discord.TextChannel):
+            reset_ticket_timer(message.channel, state, INITIAL_TICKET_TTL)
+        return
+    current_total = sum(Path(p).stat().st_size for p in state.get("source_files", []) if Path(p).exists())
+    incoming_total = sum(int(a.size or 0) for a in attachments)
+    if current_total + incoming_total > MAX_MERGE_TOTAL_UPLOAD_BYTES:
+        await message.channel.send(f"ขนาดไฟล์รวมเกินกำหนด ({_format_bytes(current_total + incoming_total)} / สูงสุด {_format_bytes(MAX_MERGE_TOTAL_UPLOAD_BYTES)}) กรุณาลดจำนวนหรือขนาดไฟล์")
+        if isinstance(message.channel, discord.TextChannel):
+            reset_ticket_timer(message.channel, state, INITIAL_TICKET_TTL)
+        return
+    if isinstance(message.channel, discord.TextChannel):
+        reset_ticket_timer(message.channel, state, ACTIVE_TICKET_TTL)
     if not state.get("work_dir"):
         state["work_dir"] = tempfile.mkdtemp(prefix=f"addon_merge_{message.author.id}_", dir=TEMP_ROOT)
     job_dir = Path(state["work_dir"])
     source_files: list[str] = state.setdefault("source_files", [])
     saved_count = 0
+    saved_paths: list[str] = []
     for attachment in attachments:
         if len(source_files) >= MAX_MERGE_ADDONS:
             break
@@ -834,6 +959,7 @@ async def handle_merge_addons_message(message: discord.Message, state: dict, att
             target = job_dir / f"{len(source_files)+1}_{attachment.filename}"
         await attachment.save(target)
         source_files.append(str(target))
+        saved_paths.append(str(target))
         saved_count += 1
 
     if saved_count == 0:
@@ -842,8 +968,28 @@ async def handle_merge_addons_message(message: discord.Message, state: dict, att
 
     try:
         await _refresh_merge_preview(message.channel, state)  # type: ignore[arg-type]
+        if isinstance(message.channel, discord.TextChannel):
+            reset_ticket_timer(message.channel, state, ACTIVE_TICKET_TTL)
     except Exception as exc:
-        await message.channel.send(f"ตรวจสอบไฟล์รวมแอดออนไม่สำเร็จ: `{exc}`")
+        user_message = str(exc)
+        if "ไม่พบ Behavior Pack manifest" in user_message or "ไม่พบ Resource Pack manifest" in user_message:
+            user_message = (
+                "ไฟล์บางตัวไม่ใช่ `.mcaddon` ที่มีทั้ง Behavior Pack และ Resource Pack หรือ manifest ไม่ระบุ module ให้ถูกต้อง\n"
+                "โหมดรวมแอดออนเวอร์ชันนี้ต้องมี manifest `type: data` สำหรับ BP และ `type: resources` สำหรับ RP ในแต่ละไฟล์"
+            )
+        await message.channel.send(f"ตรวจสอบไฟล์รวมแอดออนไม่สำเร็จ:\n```text\n{user_message[:1800]}\n```")
+        for saved in saved_paths:
+            try:
+                if saved in source_files:
+                    source_files.remove(saved)
+                Path(saved).unlink(missing_ok=True)
+            except Exception:
+                pass
+        if not source_files:
+            _cleanup_work_dir(state.get("work_dir"))
+            state["work_dir"] = None
+        if isinstance(message.channel, discord.TextChannel):
+            reset_ticket_timer(message.channel, state, INITIAL_TICKET_TTL)
         return
 
     if len(source_files) < MIN_MERGE_ADDONS:
@@ -888,6 +1034,7 @@ async def start_health_server() -> None:
 
 
 async def main() -> None:
+    bot.add_view(StartPanelView())
     await start_health_server()
     await bot.start(DISCORD_TOKEN)
 
