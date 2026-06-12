@@ -63,6 +63,9 @@ MAX_MERGE_TOTAL_UPLOAD_BYTES = int(os.getenv("MAX_MERGE_TOTAL_UPLOAD_BYTES", str
 INITIAL_TICKET_TTL = int(os.getenv("INITIAL_TICKET_TTL", "180"))
 ACTIVE_TICKET_TTL = int(os.getenv("ACTIVE_TICKET_TTL", "900"))
 FINISHED_TICKET_TTL = int(os.getenv("FINISHED_TICKET_TTL", "60"))
+# Safety TTL used only while a convert/merge job is actively running. A ticket
+# must not be auto-deleted while the bot is still building the output file.
+PROCESSING_TICKET_TTL = int(os.getenv("PROCESSING_TICKET_TTL", "3600"))
 STALE_TICKET_CLEANUP_MINUTES = int(os.getenv("STALE_TICKET_CLEANUP_MINUTES", "30"))
 
 if not DISCORD_TOKEN:
@@ -254,18 +257,34 @@ async def schedule_delete(
 ) -> None:
     """Delete a temporary ticket only if this is still the active timer.
 
-    Important: a cancelled timer must not pop TICKETS or delete temp files. The
-    previous patch reset timers by cancelling the old task, but the old task
-    still ran its finally block and removed the ticket state. That made the next
-    dropdown/button interaction answer "ticket หมดอายุแล้ว" immediately and also
-    broke the merge workflow after the first upload.
+    A cancelled timer must not pop TICKETS or delete temp files. Also, a ticket
+    must never be deleted while a convert/merge job is actively running. Some
+    merge jobs can start when the previous ACTIVE_TICKET_TTL timer has only a
+    little time left; without the processing guard, the channel can disappear
+    before the output file is sent.
     """
     should_cleanup = False
     try:
         await asyncio.sleep(delay)
+        current_state = None
         if channel_id is not None and generation is not None:
             current_state = TICKETS.get(channel_id)
             if not current_state or current_state.get("timer_generation") != generation:
+                return
+            if current_state.get("processing") or current_state.get("merge_running") or current_state.get("convert_running"):
+                # Extra safety net: if an old/active timer reaches zero during a
+                # long-running job, extend the timer instead of deleting the room.
+                new_generation = int(current_state.get("timer_generation") or 0) + 1
+                current_state["timer_generation"] = new_generation
+                current_state["delete_task"] = asyncio.create_task(
+                    schedule_delete(
+                        channel,
+                        PROCESSING_TICKET_TTL,
+                        channel_id=channel.id,
+                        work_dir=current_state.get("work_dir"),
+                        generation=new_generation,
+                    )
+                )
                 return
         await channel.delete(reason="Temporary addon ticket expired")
         should_cleanup = True
@@ -292,10 +311,32 @@ async def schedule_delete(
             _cleanup_work_dir(work_dir)
 
 
+def _cancel_ticket_timer(state: dict) -> None:
+    old_task = state.get("delete_task")
+    if old_task and not old_task.done():
+        old_task.cancel()
+    state["delete_task"] = None
+    state["timer_generation"] = int(state.get("timer_generation") or 0) + 1
+
+
+def start_ticket_processing(channel: discord.TextChannel, state: dict, label: str) -> None:
+    """Mark a ticket as busy so auto-cleanup cannot delete it mid-job."""
+    old_task = state.get("delete_task")
+    if old_task and not old_task.done():
+        old_task.cancel()
+    generation = int(state.get("timer_generation") or 0) + 1
+    state["timer_generation"] = generation
+    state["processing"] = label
+    state["delete_task"] = asyncio.create_task(
+        schedule_delete(channel, PROCESSING_TICKET_TTL, channel_id=channel.id, work_dir=state.get("work_dir"), generation=generation)
+    )
+
+
 def reset_ticket_timer(channel: discord.TextChannel, state: dict, delay: int) -> None:
     old_task = state.get("delete_task")
     if old_task and not old_task.done():
         old_task.cancel()
+    state.pop("processing", None)
     generation = int(state.get("timer_generation") or 0) + 1
     state["timer_generation"] = generation
     state["delete_task"] = asyncio.create_task(
@@ -456,6 +497,9 @@ async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> N
     if not work_dir or not source_file:
         await interaction.followup.send("ไม่พบไฟล์ต้นฉบับใน ticket นี้")
         return
+    if isinstance(channel, discord.TextChannel):
+        state["convert_running"] = True
+        start_ticket_processing(channel, state, "ui_convert")
     try:
         async with convert_semaphore:
             converted = await asyncio.to_thread(convert_addon, source_file, selected_ids, work_dir, slot_mode, custom_slots)
@@ -487,11 +531,13 @@ async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> N
             files=[Path(source_file), converted_path],
         )
     except Exception as exc:
+        state["convert_running"] = False
         await interaction.followup.send(f"แปลงไม่สำเร็จ: `{exc}`")
         await send_webhook_log(title="Addon UI Convert Failed", description=str(exc), color=0xED4245, fields=[("User", f"{interaction.user}\n`{interaction.user.id}`", False)])
         if isinstance(channel, discord.TextChannel):
             reset_ticket_timer(channel, state, ACTIVE_TICKET_TTL)
         return
+    state["convert_running"] = False
     if isinstance(channel, discord.TextChannel):
         reset_ticket_timer(channel, state, FINISHED_TICKET_TTL)
 
@@ -887,6 +933,8 @@ async def run_merge_job(channel: discord.TextChannel, user: discord.abc.User, st
         state["source_files"] = source_files
 
     state["merge_running"] = True
+    if isinstance(channel, discord.TextChannel):
+        start_ticket_processing(channel, state, "merge_addons")
     state["awaiting_merge_icon"] = False
     await _update_merge_preview_message(channel, state, disabled=True)
     await channel.send(f"ได้รับ {len(source_files)} ไฟล์แล้ว กำลังรวมแอดออนตามชื่อ/รูปที่ตั้งไว้ อาจใช้เวลาสักครู่...")
@@ -931,6 +979,7 @@ async def run_merge_job(channel: discord.TextChannel, user: discord.abc.User, st
         )
         reset_ticket_timer(channel, state, ACTIVE_TICKET_TTL)
         return
+    state["merge_running"] = False
     reset_ticket_timer(channel, state, FINISHED_TICKET_TTL)
 
 

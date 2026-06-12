@@ -105,6 +105,7 @@ MAX_ZIP_MEMBER_NAME_LENGTH=240
 INITIAL_TICKET_TTL=180
 ACTIVE_TICKET_TTL=900
 FINISHED_TICKET_TTL=60
+PROCESSING_TICKET_TTL=3600
 STALE_TICKET_CLEANUP_MINUTES=30
 ```
 
@@ -198,5 +199,6 @@ This avoids the Bedrock issue where hidden custom wearables can remain give-able
 - `_safe_extract()` ตรวจจำนวนไฟล์ใน zip, ขนาดหลังแตก, ขนาดไฟล์เดี่ยว, path traversal และชื่อไฟล์ที่ยาวผิดปกติ
 - หลังส่งไฟล์สำเร็จหรือ ticket หมดเวลา ระบบจะลบ temp work directory อัตโนมัติ
 - ถ้าผู้ใช้อัปโหลดแล้วไม่กด dropdown/button ต่อ ticket จะถูกลบหลัง `ACTIVE_TICKET_TTL`
+- ระหว่างที่บอทกำลังแปลงหรือรวม addon อยู่ ticket จะถูกล็อกไว้ด้วย `PROCESSING_TICKET_TTL` เพื่อไม่ให้ถูกลบกลางงาน
 - ถ้าบอท restart แล้วเหลือ ticket channel เก่าที่ state หาย ระบบจะลบ ticket เก่าใน category ที่ตั้งไว้หลังเกิน `STALE_TICKET_CLEANUP_MINUTES`
 - `/setup` แก้ข้อความ merge report ให้ตรงกับพฤติกรรมจริง: report ถูกส่งไป webhook ไม่ได้ฝัง `MERGE_REPORT.txt` ใน pack
