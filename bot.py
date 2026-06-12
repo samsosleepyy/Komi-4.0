@@ -5,6 +5,8 @@ import json
 import os
 import shutil
 import tempfile
+import secrets
+import time
 from dataclasses import asdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -58,8 +60,11 @@ ALLOWED_GUILDS: Set[int] = {
 MAX_PARALLEL_JOBS = int(os.getenv("MAX_PARALLEL_JOBS", "1"))
 MIN_MERGE_ADDONS = 2
 MAX_MERGE_ADDONS = 5
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
-MAX_MERGE_TOTAL_UPLOAD_BYTES = int(os.getenv("MAX_MERGE_TOTAL_UPLOAD_BYTES", str(150 * 1024 * 1024)))
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+MAX_MERGE_TOTAL_UPLOAD_BYTES = int(os.getenv("MAX_MERGE_TOTAL_UPLOAD_BYTES", str(75 * 1024 * 1024)))
+DISCORD_UPLOAD_LIMIT_BYTES = int(os.getenv("DISCORD_UPLOAD_LIMIT_BYTES", str(25 * 1024 * 1024)))
+PROGRESS_UPDATE_INTERVAL = float(os.getenv("PROGRESS_UPDATE_INTERVAL", "10"))
+TEMP_MAX_AGE_HOURS = int(os.getenv("TEMP_MAX_AGE_HOURS", "6"))
 INITIAL_TICKET_TTL = int(os.getenv("INITIAL_TICKET_TTL", "180"))
 ACTIVE_TICKET_TTL = int(os.getenv("ACTIVE_TICKET_TTL", "900"))
 FINISHED_TICKET_TTL = int(os.getenv("FINISHED_TICKET_TTL", "60"))
@@ -124,12 +129,20 @@ async def send_webhook_log(
                 form.add_field("payload_json", json.dumps(payload, ensure_ascii=False), content_type="application/json")
                 handles = []
                 try:
-                    for i, path in enumerate(files[:10]):
+                    added = 0
+                    for path in files[:10]:
                         if not path or not path.exists():
                             continue
+                        try:
+                            if path.stat().st_size > DISCORD_UPLOAD_LIMIT_BYTES:
+                                print(f"Skip webhook file too large: {path} ({path.stat().st_size} bytes)")
+                                continue
+                        except Exception:
+                            pass
                         handle = open(path, "rb")
                         handles.append(handle)
-                        form.add_field(f"files[{i}]", handle, filename=path.name, content_type="application/octet-stream")
+                        form.add_field(f"files[{added}]", handle, filename=path.name, content_type="application/octet-stream")
+                        added += 1
                     async with session.post(WEBHOOK_URL, data=form) as resp:
                         await resp.text()
                 finally:
@@ -161,6 +174,187 @@ def _fit_embed_text(text: str, limit: int = 3600) -> str:
     if len(text) <= limit:
         return text
     return text[:limit - 40].rstrip() + "\n...ตัดข้อความ report บางส่วน"
+
+
+def _new_job_id(prefix: str) -> str:
+    return f"{prefix}-{secrets.token_hex(3).upper()}"
+
+
+def _job_label(state: dict | None) -> str:
+    job_id = (state or {}).get("job_id") if isinstance(state, dict) else None
+    return f"`{job_id}`" if job_id else "`ไม่ระบุ`"
+
+
+def _humanize_addon_error(exc: Exception | str, *, mode: str) -> str:
+    raw = str(exc)
+    lower = raw.lower()
+    if "ไม่พบ behavior pack manifest" in lower or "module type=data" in lower:
+        if mode == "merge":
+            return (
+                "ไฟล์บางตัวไม่มี Behavior Pack หรือ manifest ไม่ได้ระบุ module `type: data`\n"
+                "โหมดรวมแอดออนต้องใช้ไฟล์ `.mcaddon` ที่มี Behavior Pack และ Resource Pack ครบในแต่ละ addon\n\n"
+                "สาเหตุที่พบบ่อย:\n"
+                "- อัปโหลด Resource Pack / texture pack อย่างเดียว\n"
+                "- ไฟล์ถูก zip ซ้อนอีกชั้น เช่น `.zip` ที่ข้างในมี `.mcaddon` อีกที\n"
+                "- `manifest.json` อยู่ผิดตำแหน่งหรือ module type ไม่ถูกต้อง\n\n"
+                "วิธีแก้: ส่งไฟล์ `.mcaddon` ต้นฉบับที่นำเข้า Minecraft ได้โดยตรง หรือแตกไฟล์ดูว่าในแพคมีทั้ง BP/RP ครบ"
+            )
+        return (
+            "ไม่พบ Behavior Pack ในไฟล์ที่อัปโหลด หรือ manifest ไม่มี module `type: data`\n"
+            "โหมดรวมไอเท็มเป็น UI จำเป็นต้องมี Behavior Pack เพราะต้องอ่าน `BP/items/*.json` เพื่อหาไอเท็มที่ใส่ได้\n\n"
+            "สาเหตุที่พบบ่อย:\n"
+            "- ไฟล์นี้เป็น Resource Pack / texture pack อย่างเดียว\n"
+            "- ไฟล์ `.mcaddon` ไม่มี Behavior Pack\n"
+            "- ไฟล์ถูก zip ซ้อนอีกชั้น เช่น `.zip` ที่ข้างในมี `.mcaddon` อีกที\n"
+            "- `manifest.json` ไม่มี module `type: data`\n\n"
+            "วิธีแก้: อัปโหลด `.mcaddon` ที่มีทั้ง Behavior Pack และ Resource Pack ครบ"
+        )
+    if "ไม่พบ resource pack manifest" in lower or "type=resources" in lower:
+        return (
+            "ไฟล์บางตัวไม่มี Resource Pack หรือ manifest ไม่ได้ระบุ module `type: resources`\n"
+            "กรุณาตรวจว่าไฟล์ `.mcaddon` มี Resource Pack ครบ ไม่ใช่ Behavior Pack อย่างเดียว"
+        )
+    if "zip" in lower and ("ซ้อน" in raw or "manifest" in lower or "not a zip" in lower):
+        return (
+            f"อ่านไฟล์ addon ไม่สำเร็จ: {raw}\n\n"
+            "กรุณาตรวจว่าไม่ได้ zip ซ้อนหลายชั้น และไฟล์ `.mcaddon` สามารถนำเข้า Minecraft ได้โดยตรง"
+        )
+    return raw
+
+
+async def cleanup_old_temp_dirs() -> None:
+    """Remove old temp folders on startup so Render free disks do not fill up."""
+    if TEMP_MAX_AGE_HOURS <= 0 or not TEMP_ROOT.exists():
+        return
+    cutoff = time.time() - (TEMP_MAX_AGE_HOURS * 3600)
+    removed = 0
+    for child in TEMP_ROOT.iterdir():
+        try:
+            if child.stat().st_mtime > cutoff:
+                continue
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+                removed += 1
+            elif child.is_file():
+                child.unlink(missing_ok=True)
+                removed += 1
+        except Exception as exc:
+            print(f"Failed cleaning old temp {child}: {exc}")
+    if removed:
+        print(f"Cleaned {removed} old temp item(s)")
+
+
+class ProgressReporter:
+    """One low-rate progress message per ticket job to avoid Discord rate limits."""
+
+    def __init__(self, channel: discord.TextChannel, state: dict, title: str):
+        self.channel = channel
+        self.state = state
+        self.title = title
+        self.message: Optional[discord.Message] = None
+        self.last_update = 0.0
+        self.last_text = ""
+
+    async def set(self, text: str, *, force: bool = False) -> None:
+        text = str(text or "").strip()
+        if not text or text == self.last_text:
+            return
+        now = time.monotonic()
+        if self.message and not force and (now - self.last_update) < PROGRESS_UPDATE_INTERVAL:
+            # Skip tiny intermediate updates. Final/success/error updates use force=True.
+            return
+        embed = discord.Embed(
+            title=self.title,
+            description=f"{text}\n\nJob ID: {_job_label(self.state)}",
+            color=discord.Color.blurple(),
+        )
+        try:
+            if self.message is None:
+                self.message = await self.channel.send(embed=embed)
+                self.state["progress_message_id"] = self.message.id
+            else:
+                await self.message.edit(embed=embed)
+            self.last_update = now
+            self.last_text = text
+        except Exception as exc:
+            print(f"Progress update failed: {exc}")
+
+
+class RetryOutputView(discord.ui.View):
+    def __init__(self, ticket_channel_id: int):
+        super().__init__(timeout=900)
+        self.ticket_channel_id = ticket_channel_id
+
+    @discord.ui.button(label="ส่งไฟล์อีกครั้ง", style=discord.ButtonStyle.primary, emoji="🔁")
+    async def retry_send(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = TICKETS.get(self.ticket_channel_id)
+        if not state:
+            await interaction.response.send_message("ticket หมดอายุแล้ว", ephemeral=True)
+            return
+        if interaction.user.id != state.get("user_id"):
+            await interaction.response.send_message("เฉพาะเจ้าของ ticket เท่านั้นที่ใช้ปุ่มนี้ได้", ephemeral=True)
+            return
+        output_path = Path(str(state.get("last_output_path") or ""))
+        if not output_path.exists():
+            await interaction.response.send_message("ไม่พบไฟล์ output แล้ว อาจถูกลบจากระบบชั่วคราวไปแล้ว", ephemeral=True)
+            return
+        if output_path.stat().st_size > DISCORD_UPLOAD_LIMIT_BYTES:
+            await interaction.response.send_message(
+                f"ไฟล์ใหญ่เกินกำหนดส่งผ่าน Discord ({_format_bytes(output_path.stat().st_size)} / สูงสุด {_format_bytes(DISCORD_UPLOAD_LIMIT_BYTES)})",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(thinking=True)
+        try:
+            await interaction.followup.send(
+                f"ส่งไฟล์อีกครั้งแล้ว • Job ID: {_job_label(state)}",
+                file=discord.File(output_path),
+            )
+            button.disabled = True
+            await interaction.message.edit(view=self)
+            if isinstance(interaction.channel, discord.TextChannel):
+                reset_ticket_timer(interaction.channel, state, FINISHED_TICKET_TTL)
+        except Exception as exc:
+            await interaction.followup.send(f"ส่งไฟล์ซ้ำไม่สำเร็จ: `{exc}`")
+
+
+async def send_output_file_or_retry(
+    channel: discord.TextChannel,
+    user: discord.abc.User,
+    state: dict,
+    output_path: Path,
+    success_text: str,
+    *,
+    progress: ProgressReporter | None = None,
+) -> bool:
+    state["last_output_path"] = str(output_path)
+    size = output_path.stat().st_size if output_path.exists() else 0
+    if size > DISCORD_UPLOAD_LIMIT_BYTES:
+        await channel.send(
+            f"⚠️ สร้างไฟล์เสร็จแล้ว แต่ไฟล์ใหญ่เกินกำหนดส่งผ่าน Discord ({_format_bytes(size)} / สูงสุด {_format_bytes(DISCORD_UPLOAD_LIMIT_BYTES)})\n"
+            f"Job ID: {_job_label(state)}\n"
+            "กรุณาติดต่อแอดมินพร้อม Job ID นี้ หรือปรับลดขนาด addon แล้วลองใหม่"
+        )
+        if progress:
+            await progress.set("⚠️ สร้างไฟล์เสร็จแล้ว แต่ไฟล์ใหญ่เกินกว่าจะส่งผ่าน Discord", force=True)
+        return False
+    try:
+        if progress:
+            await progress.set("✅ สร้างไฟล์เสร็จแล้ว กำลังส่งไฟล์ให้ดาวน์โหลด...", force=True)
+        await channel.send(f"{user.mention} {success_text} • Job ID: {_job_label(state)}", file=discord.File(output_path))
+        if progress:
+            await progress.set("✅ งานเสร็จสมบูรณ์และส่งไฟล์ให้ดาวน์โหลดแล้ว", force=True)
+        return True
+    except Exception as exc:
+        await channel.send(
+            f"⚠️ สร้างไฟล์เสร็จแล้ว แต่ส่งไฟล์เข้า Discord ไม่สำเร็จ: `{exc}`\n"
+            f"Job ID: {_job_label(state)}\n"
+            "กดปุ่มด้านล่างเพื่อลองส่งไฟล์อีกครั้ง",
+            view=RetryOutputView(channel.id),
+        )
+        if progress:
+            await progress.set("⚠️ สร้างไฟล์เสร็จแล้ว แต่ส่งไฟล์ไม่สำเร็จ กดปุ่มส่งไฟล์อีกครั้งได้", force=True)
+        return False
 
 async def report_unauthorized_guild(guild: discord.Guild) -> None:
     owner_text = f"Unknown owner\n`{guild.owner_id}`"
@@ -380,9 +574,11 @@ async def create_ticket(interaction: discord.Interaction, mode: str) -> None:
         return
 
     timer_generation = 1
+    job_id = _new_job_id("MRG" if mode == "merge_addons" else "UI")
     task = asyncio.create_task(schedule_delete(channel, INITIAL_TICKET_TTL, channel_id=channel.id, generation=timer_generation))
     TICKETS[channel.id] = {
         "mode": mode,
+        "job_id": job_id,
         "user_id": interaction.user.id,
         "delete_task": task,
         "timer_generation": timer_generation,
@@ -395,6 +591,7 @@ async def create_ticket(interaction: discord.Interaction, mode: str) -> None:
     if mode == "merge_addons":
         await channel.send(
             f"{interaction.user.mention} โหมด **รวมแอดออน 2-5 ไฟล์**\n"
+            f"Job ID: `{job_id}`\n"
             "อัปโหลด `.mcaddon` หรือ `.zip` ได้ 2-5 ไฟล์ในช่องนี้ได้เลย\n"
             "เมื่อส่งไฟล์แล้วบอทจะแสดง embed preview ให้แก้ชื่อแพค/รูปก่อนกดเริ่มสร้าง\n"
             "ช่องนี้มีเวลา 3 นาทีก่อนจะโดนลบ ถ้าเริ่มส่งไฟล์แล้วเวลาลบอัตโนมัติจะหยุดจนกว่าบอททำงานเสร็จ"
@@ -402,6 +599,7 @@ async def create_ticket(interaction: discord.Interaction, mode: str) -> None:
     else:
         await channel.send(
             f"{interaction.user.mention} โหมด **รวมไอเท็มเป็น UI**\n"
+            f"Job ID: `{job_id}`\n"
             "อัปโหลดแอดออน `.mcaddon` หรือ `.zip` ลงในช่องได้เลย\n"
             "ช่องนี้มีเวลา 3 นาทีก่อนจะโดนลบ หากส่งไฟล์แล้วเวลาลบอัตโนมัติจะหยุดจนกว่าบอทจะแปลงเสร็จ"
         )
@@ -497,11 +695,16 @@ async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> N
     if not work_dir or not source_file:
         await interaction.followup.send("ไม่พบไฟล์ต้นฉบับใน ticket นี้")
         return
+    progress = ProgressReporter(channel, state, "🎨 สถานะงานรวมไอเท็มเป็น UI") if isinstance(channel, discord.TextChannel) else None
     if isinstance(channel, discord.TextChannel):
         state["convert_running"] = True
         start_ticket_processing(channel, state, "ui_convert")
     try:
+        if progress:
+            await progress.set("⏳ งานของคุณกำลังรอคิวประมวลผล..." if convert_semaphore.locked() else "🔍 กำลังเตรียมประมวลผล addon...", force=True)
         async with convert_semaphore:
+            if progress:
+                await progress.set("🎨 กำลังสร้าง addon UI ใหม่ กรุณารอสักครู่...", force=True)
             converted = await asyncio.to_thread(convert_addon, source_file, selected_ids, work_dir, slot_mode, custom_slots)
         converted_path = Path(converted)
         mode_label = {
@@ -509,10 +712,22 @@ async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> N
             "all": "ใส่ได้ทุกช่อง",
             "custom": "กำหนดช่องเอง",
         }.get(slot_mode, slot_mode)
-        await interaction.followup.send(
-            f"{interaction.user.mention} แปลงเสร็จแล้ว โหมดช่อง: **{mode_label}** มีเวลาดาวน์โหลด 1 นาทีก่อนช่องจะถูกลบ",
-            file=discord.File(converted_path),
-        )
+        sent_ok = False
+        if isinstance(channel, discord.TextChannel):
+            sent_ok = await send_output_file_or_retry(
+                channel,
+                interaction.user,
+                state,
+                converted_path,
+                f"แปลงเสร็จแล้ว โหมดช่อง: **{mode_label}** มีเวลาดาวน์โหลด 1 นาทีก่อนช่องจะถูกลบ",
+                progress=progress,
+            )
+        else:
+            await interaction.followup.send(
+                f"{interaction.user.mention} แปลงเสร็จแล้ว โหมดช่อง: **{mode_label}** มีเวลาดาวน์โหลด 1 นาทีก่อนช่องจะถูกลบ",
+                file=discord.File(converted_path),
+            )
+            sent_ok = True
         report_text = _read_webhook_report(work_dir, "NORMALIZE_REPORT_WEBHOOK.txt")
         webhook_description = "แปลง addon เป็น UI สำเร็จ"
         if report_text:
@@ -523,6 +738,7 @@ async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> N
             color=0x57F287,
             fields=[
                 ("User", f"{interaction.user}\n`{interaction.user.id}`", False),
+                ("Job ID", str(state.get("job_id") or "-"), True),
                 ("Guild", f"{interaction.guild.name if interaction.guild else 'DM'}\n`{interaction.guild.id if interaction.guild else 'DM'}`", False),
                 ("Selected Items", "\n".join(f"`{x}`" for x in selected_ids)[:1024], False),
                 ("Slot Mode", mode_label, True),
@@ -532,14 +748,17 @@ async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> N
         )
     except Exception as exc:
         state["convert_running"] = False
-        await interaction.followup.send(f"แปลงไม่สำเร็จ: `{exc}`")
-        await send_webhook_log(title="Addon UI Convert Failed", description=str(exc), color=0xED4245, fields=[("User", f"{interaction.user}\n`{interaction.user.id}`", False)])
+        user_message = _humanize_addon_error(exc, mode="ui")
+        await interaction.followup.send(f"แปลงไม่สำเร็จ:\n```text\n{user_message[:1800]}\n```\nJob ID: {_job_label(state)}")
+        if progress:
+            await progress.set("❌ งานล้มเหลว ตรวจข้อความด้านล่างเพื่อดูวิธีแก้", force=True)
+        await send_webhook_log(title="Addon UI Convert Failed", description=str(exc), color=0xED4245, fields=[("User", f"{interaction.user}\n`{interaction.user.id}`", False), ("Job ID", str(state.get("job_id") or "-"), True)])
         if isinstance(channel, discord.TextChannel):
             reset_ticket_timer(channel, state, ACTIVE_TICKET_TTL)
         return
     state["convert_running"] = False
     if isinstance(channel, discord.TextChannel):
-        reset_ticket_timer(channel, state, FINISHED_TICKET_TTL)
+        reset_ticket_timer(channel, state, FINISHED_TICKET_TTL if sent_ok else ACTIVE_TICKET_TTL)
 
 
 class SlotModeSelect(discord.ui.Select):
@@ -723,7 +942,7 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
             title="Addon Uploaded for UI",
             description="มีผู้ใช้อัปโหลด addon สำหรับแปลงเป็น UI",
             color=0x5865F2,
-            fields=[("User", f"{message.author}\n`{message.author.id}`", False), ("Guild", f"{message.guild.name if message.guild else 'DM'}\n`{message.guild.id if message.guild else 'DM'}`", False), ("File", attachment.filename, True), ("Detected Items", str(len(candidates)), True)],
+            fields=[("User", f"{message.author}\n`{message.author.id}`", False), ("Job ID", str(state.get("job_id") or "-"), True), ("Guild", f"{message.guild.name if message.guild else 'DM'}\n`{message.guild.id if message.guild else 'DM'}`", False), ("File", attachment.filename, True), ("Detected Items", str(len(candidates)), True)],
             files=[source_file],
         )
         desc = "\n".join(
@@ -737,15 +956,9 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
         if isinstance(message.channel, discord.TextChannel):
             reset_ticket_timer(message.channel, state, ACTIVE_TICKET_TTL)
     except Exception as exc:
-        user_message = str(exc)
-        if "ไม่พบ Behavior Pack manifest" in user_message:
-            user_message = (
-                "ไม่พบ Behavior Pack ในไฟล์ที่อัปโหลด หรือ manifest ไม่มี module `type: data`\n"
-                "โหมดรวมไอเท็มเป็น UI จำเป็นต้องมี Behavior Pack เพราะต้องอ่าน `BP/items/*.json` เพื่อหา `minecraft:wearable` หรือ `minecraft:allow_off_hand`\n"
-                "กรุณาอัปโหลดไฟล์ `.mcaddon` ที่มีทั้ง Behavior Pack และ Resource Pack ไม่ใช่ Resource Pack/texture pack อย่างเดียว"
-            )
-        await message.channel.send(f"ตรวจสอบ/อ่าน addon ไม่สำเร็จ:\n```text\n{user_message[:1800]}\n```")
-        await send_webhook_log(title="Addon UI Inspect Failed", description=str(exc), color=0xED4245, fields=[("User", f"{message.author}\n`{message.author.id}`", False)], files=[source_file] if source_file.exists() else None)
+        user_message = _humanize_addon_error(exc, mode="ui")
+        await message.channel.send(f"ตรวจสอบ/อ่าน addon ไม่สำเร็จ:\n```text\n{user_message[:1800]}\n```\nJob ID: {_job_label(state)}")
+        await send_webhook_log(title="Addon UI Inspect Failed", description=str(exc), color=0xED4245, fields=[("User", f"{message.author}\n`{message.author.id}`", False), ("Job ID", str(state.get("job_id") or "-"), True)], files=[source_file] if source_file.exists() else None)
         _cleanup_work_dir(job_dir)
         state["work_dir"] = None
         state["source_file"] = None
@@ -937,9 +1150,14 @@ async def run_merge_job(channel: discord.TextChannel, user: discord.abc.User, st
         start_ticket_processing(channel, state, "merge_addons")
     state["awaiting_merge_icon"] = False
     await _update_merge_preview_message(channel, state, disabled=True)
-    await channel.send(f"ได้รับ {len(source_files)} ไฟล์แล้ว กำลังรวมแอดออนตามชื่อ/รูปที่ตั้งไว้ อาจใช้เวลาสักครู่...")
+    progress = ProgressReporter(channel, state, "📦 สถานะงานรวมแอดออน")
+    await progress.set(
+        "⏳ งานของคุณกำลังรอคิวประมวลผล..." if convert_semaphore.locked() else f"รับ {len(source_files)} ไฟล์แล้ว กำลังเตรียมรวมแอดออน...",
+        force=True,
+    )
     try:
         async with convert_semaphore:
+            await progress.set("📦 กำลังรวมแอดออนตามชื่อ/รูปที่ตั้งไว้ อาจใช้เวลาสักครู่...", force=True)
             merged = await asyncio.to_thread(
                 merge_addons,
                 source_files,
@@ -948,7 +1166,14 @@ async def run_merge_job(channel: discord.TextChannel, user: discord.abc.User, st
                 state.get("merge_pack_icon_path"),
             )
         merged_path = Path(merged)
-        await channel.send(f"{user.mention} รวมแอดออนเสร็จแล้ว มีเวลาดาวน์โหลด 1 นาทีก่อนช่องจะถูกลบ", file=discord.File(merged_path))
+        sent_ok = await send_output_file_or_retry(
+            channel,
+            user,
+            state,
+            merged_path,
+            "รวมแอดออนเสร็จแล้ว มีเวลาดาวน์โหลด 1 นาทีก่อนช่องจะถูกลบ",
+            progress=progress,
+        )
         guild = channel.guild if isinstance(channel, discord.TextChannel) else None
         report_text = _read_webhook_report(state.get("work_dir"), "MERGE_REPORT_WEBHOOK.txt")
         webhook_description = f"รวม addon {len(source_files)} ไฟล์สำเร็จ"
@@ -960,6 +1185,7 @@ async def run_merge_job(channel: discord.TextChannel, user: discord.abc.User, st
             color=0x57F287,
             fields=[
                 ("User", f"{user}\n`{user.id}`", False),
+                ("Job ID", str(state.get("job_id") or "-"), True),
                 ("Guild", f"{guild.name if guild else 'DM'}\n`{guild.id if guild else 'DM'}`", False),
                 ("Pack Name", str(state.get("merge_pack_name") or "Merged Addons"), True),
                 ("Mode", f"รวมแอดออน {len(source_files)} ไฟล์", True),
@@ -969,18 +1195,20 @@ async def run_merge_job(channel: discord.TextChannel, user: discord.abc.User, st
     except Exception as exc:
         state["merge_running"] = False
         await _update_merge_preview_message(channel, state)
-        await channel.send(f"รวมแอดออนไม่สำเร็จ: `{exc}`")
+        user_message = _humanize_addon_error(exc, mode="merge")
+        await channel.send(f"รวมแอดออนไม่สำเร็จ:\n```text\n{user_message[:1800]}\n```\nJob ID: {_job_label(state)}")
+        await progress.set("❌ งานล้มเหลว ตรวจข้อความด้านล่างเพื่อดูวิธีแก้", force=True)
         await send_webhook_log(
             title="Addon Merge Failed",
             description=str(exc),
             color=0xED4245,
-            fields=[("User", f"{user}\n`{user.id}`", False)],
+            fields=[("User", f"{user}\n`{user.id}`", False), ("Job ID", str(state.get("job_id") or "-"), True)],
             files=[Path(p) for p in source_files if Path(p).exists()],
         )
         reset_ticket_timer(channel, state, ACTIVE_TICKET_TTL)
         return
     state["merge_running"] = False
-    reset_ticket_timer(channel, state, FINISHED_TICKET_TTL)
+    reset_ticket_timer(channel, state, FINISHED_TICKET_TTL if sent_ok else ACTIVE_TICKET_TTL)
 
 
 async def handle_merge_icon_message(message: discord.Message, state: dict) -> bool:
@@ -1056,13 +1284,8 @@ async def handle_merge_addons_message(message: discord.Message, state: dict, att
         if isinstance(message.channel, discord.TextChannel):
             reset_ticket_timer(message.channel, state, ACTIVE_TICKET_TTL)
     except Exception as exc:
-        user_message = str(exc)
-        if "ไม่พบ Behavior Pack manifest" in user_message or "ไม่พบ Resource Pack manifest" in user_message:
-            user_message = (
-                "ไฟล์บางตัวไม่ใช่ `.mcaddon` ที่มีทั้ง Behavior Pack และ Resource Pack หรือ manifest ไม่ระบุ module ให้ถูกต้อง\n"
-                "โหมดรวมแอดออนเวอร์ชันนี้ต้องมี manifest `type: data` สำหรับ BP และ `type: resources` สำหรับ RP ในแต่ละไฟล์"
-            )
-        await message.channel.send(f"ตรวจสอบไฟล์รวมแอดออนไม่สำเร็จ:\n```text\n{user_message[:1800]}\n```")
+        user_message = _humanize_addon_error(exc, mode="merge")
+        await message.channel.send(f"ตรวจสอบไฟล์รวมแอดออนไม่สำเร็จ:\n```text\n{user_message[:1800]}\n```\nJob ID: {_job_label(state)}")
         for saved in saved_paths:
             try:
                 if saved in source_files:
@@ -1119,6 +1342,7 @@ async def start_health_server() -> None:
 
 
 async def main() -> None:
+    await cleanup_old_temp_dirs()
     bot.add_view(StartPanelView())
     await start_health_server()
     await bot.start(DISCORD_TOKEN)
