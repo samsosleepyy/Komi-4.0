@@ -158,6 +158,8 @@ class ExistingUiInspection:
     script_path: str
     selector_id: str
     ui_title: str
+    pack_name: str
+    has_pack_icon: bool
     current_slot_mode: str
     current_slot_mode_label: str
     item_count: int
@@ -512,6 +514,19 @@ def _summarize_ui_slot_mode(armors: List[Dict[str, Any]]) -> Tuple[str, str]:
     return "unknown", "ไม่พบข้อมูลช่อง"
 
 
+def _existing_ui_pack_name(bp: Path, rp: Path) -> str:
+    for pack in (bp, rp):
+        try:
+            manifest = _read_json(pack / "manifest.json")
+            name = str(manifest.get("header", {}).get("name") or "").strip()
+            if name:
+                name = re.sub(r"\s+(BP|RP|Behavior Pack|Resource Pack)\s*$", "", name, flags=re.I).strip()
+                return name or str(manifest.get("header", {}).get("name") or "Addon UI")
+        except Exception:
+            continue
+    return "Addon UI"
+
+
 def _ui_config_to_inspection(src: Path, root: Path, bp: Path, rp: Path, script: Path, cfg: Dict[str, Any]) -> ExistingUiInspection:
     armors = [a for a in cfg.get("armors", []) if isinstance(a, dict)]
     mode, mode_label = _summarize_ui_slot_mode(armors)
@@ -536,6 +551,8 @@ def _ui_config_to_inspection(src: Path, root: Path, bp: Path, rp: Path, script: 
         script_path=str(script.relative_to(root).as_posix()),
         selector_id=str(cfg.get("menuItem") or ""),
         ui_title=str(cfg.get("uiTitle") or "Addon UI"),
+        pack_name=_existing_ui_pack_name(bp, rp),
+        has_pack_icon=(bp / "pack_icon.png").exists() or (rp / "pack_icon.png").exists(),
         current_slot_mode=mode,
         current_slot_mode_label=mode_label,
         item_count=len(items),
@@ -578,17 +595,172 @@ def _set_existing_ui_creative_visibility(bp: Path, selector_id: str, visible_ite
         _write_json(item_path, data)
 
 
+def _set_manifest_pack_name(pack_dir: Path, pack_name: str, suffix: str) -> None:
+    manifest_path = pack_dir / "manifest.json"
+    if not manifest_path.exists():
+        return
+    data = _read_json(manifest_path)
+    header = data.setdefault("header", {})
+    header["name"] = f"{pack_name} {suffix}".strip()
+    _write_json(manifest_path, data)
+
+
+def _update_lang_key(lines: List[str], key: str, value: str) -> List[str]:
+    prefix = f"{key}="
+    out: List[str] = []
+    replaced = False
+    for line in lines:
+        if line.startswith(prefix):
+            if not replaced:
+                out.append(prefix + value)
+                replaced = True
+            continue
+        out.append(line)
+    if not replaced:
+        out.append(prefix + value)
+    return out
+
+
+def _update_existing_ui_lang_names(rp: Path, selector_id: str, selector_label: Optional[str], item_labels: Dict[str, str]) -> None:
+    texts = rp / "texts"
+    if not texts.exists():
+        return
+    for lang_path in texts.glob("*.lang"):
+        try:
+            lines = lang_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        if selector_label and selector_id:
+            lines = _update_lang_key(lines, f"item.{selector_id}.name", selector_label)
+            short = selector_id.split(":", 1)[-1]
+            lines = _update_lang_key(lines, f"item.{short}.name", selector_label)
+        for item_id, label in item_labels.items():
+            if not item_id or not label:
+                continue
+            lines = _update_lang_key(lines, f"item.{item_id}.name", label)
+            short = item_id.split(":", 1)[-1]
+            lines = _update_lang_key(lines, f"item.{short}.name", label)
+        lang_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _update_existing_ui_item_display_names(bp: Path, labels_by_item_id: Dict[str, str]) -> None:
+    if not labels_by_item_id:
+        return
+    for item_path in (bp / "items").rglob("*.json") if (bp / "items").exists() else []:
+        try:
+            data = _read_json(item_path)
+        except Exception:
+            continue
+        item = data.get("minecraft:item") if isinstance(data, dict) else None
+        if not isinstance(item, dict):
+            continue
+        desc = item.get("description") if isinstance(item.get("description"), dict) else {}
+        item_id = str(desc.get("identifier") or "")
+        label = labels_by_item_id.get(item_id)
+        if not label:
+            continue
+        comps = item.setdefault("components", {})
+        comps["minecraft:display_name"] = {"value": label}
+        _write_json(item_path, data)
+
+
+def _update_existing_ui_selector_name(bp: Path, selector_id: str, selector_label: str) -> None:
+    if not selector_id or not selector_label:
+        return
+    for item_path in (bp / "items").rglob("*.json") if (bp / "items").exists() else []:
+        try:
+            data = _read_json(item_path)
+        except Exception:
+            continue
+        item = data.get("minecraft:item") if isinstance(data, dict) else None
+        if not isinstance(item, dict):
+            continue
+        desc = item.get("description") if isinstance(item.get("description"), dict) else {}
+        if str(desc.get("identifier") or "") != selector_id:
+            continue
+        comps = item.setdefault("components", {})
+        comps["minecraft:display_name"] = {"value": selector_label}
+        _write_json(item_path, data)
+        return
+
+
+def _update_existing_ui_selector_icon_texture(bp: Path, rp: Path, selector_id: str, icon_src: Path) -> None:
+    """Also refresh the visible inventory icon of the UI selector when possible."""
+    if not selector_id or not icon_src.exists():
+        return
+    icon_key = ""
+    for item_path in (bp / "items").rglob("*.json") if (bp / "items").exists() else []:
+        try:
+            data = _read_json(item_path)
+        except Exception:
+            continue
+        item = data.get("minecraft:item") if isinstance(data, dict) else None
+        if not isinstance(item, dict):
+            continue
+        desc = item.get("description") if isinstance(item.get("description"), dict) else {}
+        if str(desc.get("identifier") or "") != selector_id:
+            continue
+        comps = item.get("components") if isinstance(item.get("components"), dict) else {}
+        raw_icon = comps.get("minecraft:icon")
+        if isinstance(raw_icon, str):
+            icon_key = raw_icon
+        elif isinstance(raw_icon, dict):
+            icon_key = str(raw_icon.get("texture") or raw_icon.get("default") or "")
+        break
+    targets = []
+    atlas = rp / "textures" / "item_texture.json"
+    if icon_key and atlas.exists():
+        try:
+            data = _read_json(atlas)
+            entry = data.get("texture_data", {}).get(icon_key)
+            texture_ref = ""
+            if isinstance(entry, dict):
+                raw = entry.get("textures")
+                if isinstance(raw, str):
+                    texture_ref = raw
+                elif isinstance(raw, list) and raw and isinstance(raw[0], str):
+                    texture_ref = raw[0]
+            if texture_ref.startswith("textures/"):
+                targets.append(rp / f"{texture_ref}.png")
+        except Exception:
+            pass
+    fallback = rp / "textures" / "item" / "auto_ui_pack_icon.png"
+    if fallback.exists():
+        targets.append(fallback)
+    seen = set()
+    for target in targets:
+        if target in seen:
+            continue
+        seen.add(target)
+        _write_resized_icon(icon_src, target)
+
+
+def _slot_label_for_existing_ui(slot_key: str) -> str:
+    return _SLOT_LABEL_BY_KEY.get(slot_key, slot_key)
+
+
+def _label_for_existing_ui_item(base_name: str, slot_key: str, kind: str = "wearable") -> str:
+    if slot_key == "offhand" or kind == "offhand":
+        return f"{base_name} (มือซ้าย)"
+    return f"{base_name} ({_slot_label_for_existing_ui(slot_key)})"
+
+
 def edit_existing_ui_addon(
     addon_path: str,
     work_dir: str,
     slot_mode: str = "keep",
     custom_slots: Optional[List[str]] = None,
     repair_duplicates: bool = False,
+    ui_title: Optional[str] = None,
+    pack_name: Optional[str] = None,
+    pack_icon_path: Optional[str] = None,
+    item_renames: Optional[Dict[str, str]] = None,
 ) -> str:
     """Edit a previously generated UI addon without converting hidden items again.
 
-    This intentionally edits the UI CONFIG only. It preserves existing files and
-    only changes which existing item variants are shown in the in-game menu.
+    This edits the existing UI CONFIG and pack metadata only. It preserves the
+    original generated item variants, so uploading a UI addon into UI mode again
+    will not create duplicate hidden items.
     """
     src = Path(addon_path)
     root = Path(work_dir) / "ui_edit_src"
@@ -611,11 +783,20 @@ def edit_existing_ui_addon(
 
     mode = (slot_mode or "keep").lower()
     allowed = [s for s in (custom_slots or []) if s in SLOT_KEYS]
+    renames = {str(k): str(v).strip() for k, v in (item_renames or {}).items() if str(v).strip()}
+
     new_armors: List[Dict[str, Any]] = []
-    for armor in armors:
+    item_labels: Dict[str, str] = {}
+    for idx, armor in enumerate(armors, start=1):
         items = armor.get("items") if isinstance(armor.get("items"), dict) else {}
         kind = armor.get("kind") or ("offhand" if "offhand" in items else "wearable")
+        if str(idx) in renames:
+            armor = dict(armor)
+            armor["name"] = renames[str(idx)]
         if kind == "offhand" or "offhand" in items:
+            item_id = items.get("offhand")
+            if isinstance(item_id, str) and item_id:
+                item_labels[item_id] = _label_for_existing_ui_item(str(armor.get("name") or f"Item {idx}"), "offhand", "offhand")
             new_armors.append(armor)
             continue
         if mode == "custom":
@@ -625,9 +806,13 @@ def edit_existing_ui_addon(
                 continue
             armor = dict(armor)
             armor["items"] = filtered
+            items = filtered
         # keep/all intentionally keep every currently available slot. Existing UI
         # addons do not always contain enough source data to safely synthesize new
         # missing slots, so we never duplicate hidden items here.
+        for slot_key, item_id in items.items():
+            if isinstance(item_id, str) and item_id:
+                item_labels[item_id] = _label_for_existing_ui_item(str(armor.get("name") or f"Item {idx}"), slot_key, kind)
         new_armors.append(armor)
 
     cfg["armors"] = new_armors
@@ -638,6 +823,29 @@ def edit_existing_ui_addon(
             if isinstance(item_id, str) and item_id:
                 all_items.append(item_id)
     cfg["allItems"] = list(dict.fromkeys(all_items))
+
+    clean_ui_title = str(ui_title or cfg.get("uiTitle") or "Addon UI").strip() or "Addon UI"
+    cfg["uiTitle"] = clean_ui_title
+
+    clean_pack_name = str(pack_name or "").strip()
+    if clean_pack_name:
+        _set_manifest_pack_name(bp, clean_pack_name, "BP")
+        _set_manifest_pack_name(rp, clean_pack_name, "RP")
+
+    if pack_icon_path:
+        icon_src = Path(pack_icon_path)
+        if icon_src.exists():
+            _write_resized_icon(icon_src, bp / "pack_icon.png")
+            _write_resized_icon(icon_src, rp / "pack_icon.png")
+            _update_existing_ui_selector_icon_texture(bp, rp, str(cfg.get("menuItem") or ""), icon_src)
+        else:
+            warnings.append("ไม่พบไฟล์รูป pack icon ที่เลือกไว้ จึงคงรูปเดิม")
+
+    selector_label = clean_ui_title
+    _update_existing_ui_selector_name(bp, str(cfg.get("menuItem") or ""), selector_label)
+    _update_existing_ui_item_display_names(bp, item_labels)
+    _update_existing_ui_lang_names(rp, str(cfg.get("menuItem") or ""), selector_label, item_labels)
+
     script.write_text(_replace_json_const_in_js(text, "CONFIG", cfg), encoding="utf-8")
     _set_existing_ui_creative_visibility(bp, str(cfg.get("menuItem") or ""), set(cfg["allItems"]))
 
@@ -645,10 +853,13 @@ def edit_existing_ui_addon(
     report = [
         "Existing UI Edit Mode report",
         f"Source: {src.name}",
+        f"Pack name: {clean_pack_name or '-'}",
         f"UI title: {cfg.get('uiTitle', '-')}",
         f"Selector: {cfg.get('menuItem', '-')}",
         f"Edit mode: {mode_label}",
         f"Custom slots: {', '.join(allowed) if allowed else '-'}",
+        f"Renamed menu entries: {len(renames)}",
+        f"Pack icon changed: {'yes' if pack_icon_path else 'no'}",
         f"Menu entries: {len(new_armors)}",
         f"Visible item variants in UI: {len(cfg['allItems'])}",
     ]
