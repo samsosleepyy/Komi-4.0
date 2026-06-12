@@ -150,6 +150,21 @@ class AddonInspection:
     rp_dir: str
     candidates: List[AddonItemCandidate]
 
+@dataclass
+class ExistingUiInspection:
+    source_path: str
+    bp_dir: str
+    rp_dir: str
+    script_path: str
+    selector_id: str
+    ui_title: str
+    current_slot_mode: str
+    current_slot_mode_label: str
+    item_count: int
+    item_variant_count: int
+    items: List[Dict[str, Any]]
+    repairable_duplicate_groups: int = 0
+
 class AddonError(Exception):
     pass
 
@@ -313,6 +328,347 @@ def _scan_candidates(root: Path, bp: Path) -> List[AddonItemCandidate]:
             item_kind="wearable" if is_wearable else "offhand",
         ))
     return candidates
+
+
+def _extract_json_const_from_js(text: str, const_name: str = "CONFIG") -> Tuple[Dict[str, Any], int, int]:
+    """Extract a JSON-style object assigned to a JS const.
+
+    The generated UI script writes CONFIG with json.dumps, so it is valid JSON
+    inside JavaScript. This parser only scans enough to find the matching brace
+    while respecting JSON strings.
+    """
+    marker = f"const {const_name} ="
+    start = text.find(marker)
+    if start < 0:
+        raise AddonError(f"ไม่พบ const {const_name} ในไฟล์สคริปต์ UI")
+    brace_start = text.find("{", start)
+    if brace_start < 0:
+        raise AddonError(f"รูปแบบ const {const_name} ไม่ถูกต้อง")
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(brace_start, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                obj_text = text[brace_start:idx + 1]
+                try:
+                    return json.loads(obj_text), start, idx + 1
+                except Exception as exc:
+                    raise AddonError(f"อ่านข้อมูล UI เดิมไม่สำเร็จ: {exc}") from exc
+    raise AddonError(f"อ่าน const {const_name} ไม่สำเร็จ: วงเล็บไม่ครบ")
+
+
+def _replace_json_const_in_js(text: str, const_name: str, data: Dict[str, Any]) -> str:
+    _old, start, end = _extract_json_const_from_js(text, const_name)
+    # Preserve the trailing semicolon if it already exists after the object.
+    semi_end = end
+    while semi_end < len(text) and text[semi_end].isspace():
+        semi_end += 1
+    if semi_end < len(text) and text[semi_end] == ";":
+        semi_end += 1
+    new_obj = f"const {const_name} = " + json.dumps(data, ensure_ascii=False, indent=2) + ";"
+    return text[:start] + new_obj + text[semi_end:]
+
+
+def _find_existing_ui_script(bp: Path) -> Optional[Path]:
+    scripts_dir = bp / "scripts"
+    roots = [scripts_dir] if scripts_dir.exists() else [bp]
+    for root in roots:
+        for script in root.rglob("*.js"):
+            try:
+                text = script.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if "const CONFIG" in text and "menuItem" in text and "armors" in text and "allItems" in text:
+                try:
+                    cfg, _, _ = _extract_json_const_from_js(text, "CONFIG")
+                except Exception:
+                    continue
+                if isinstance(cfg.get("armors"), list) and cfg.get("menuItem"):
+                    return script
+    return None
+
+
+_SLOT_LABEL_BY_KEY = {"head": "หัว", "chest": "ตัว", "legs": "กางเกง", "feet": "รองเท้า", "offhand": "มือซ้าย"}
+_SLOT_KEY_BY_LABEL = {v: k for k, v in _SLOT_LABEL_BY_KEY.items()}
+_ARMOR_SLOT_SET = set(SLOT_KEYS)
+
+
+def _ui_slot_label(slot_key: str) -> str:
+    return _SLOT_LABEL_BY_KEY.get(slot_key, slot_key)
+
+
+def _ui_item_base_and_suffix(name: str) -> Tuple[str, Optional[str]]:
+    match = re.match(r"^(.*?)\s*\((หัว|ตัว|กางเกง|รองเท้า)\)\s*$", str(name or ""))
+    if not match:
+        return str(name or ""), None
+    return match.group(1).strip(), _SLOT_KEY_BY_LABEL.get(match.group(2))
+
+
+def _detect_duplicate_ui_groups(armors: List[Dict[str, Any]]) -> int:
+    groups: Dict[str, set[str]] = {}
+    for armor in armors:
+        if not isinstance(armor, dict) or (armor.get("kind") or "wearable") == "offhand":
+            continue
+        base, suffix = _ui_item_base_and_suffix(str(armor.get("name") or ""))
+        if not base or not suffix:
+            continue
+        groups.setdefault(base, set()).add(suffix)
+    return sum(1 for suffixes in groups.values() if len(suffixes) >= 2)
+
+
+def _collapse_duplicate_ui_armors(armors: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    """Repair the common mistake: feeding a generated UI addon back into UI mode.
+
+    Double conversion creates groups like "Name (หัว)", "Name (ตัว)" and then
+    gives each group all four slots again. We collapse those groups back to one
+    menu entry by taking the matching slot from the matching suffixed group.
+    """
+    grouped: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+    passthrough: List[Dict[str, Any]] = []
+    for armor in armors:
+        if not isinstance(armor, dict) or (armor.get("kind") or "wearable") == "offhand":
+            passthrough.append(armor)
+            continue
+        base, suffix = _ui_item_base_and_suffix(str(armor.get("name") or ""))
+        if not base or not suffix:
+            passthrough.append(armor)
+            continue
+        grouped.setdefault(base, []).append((suffix, armor))
+
+    repaired = 0
+    collapsed: List[Dict[str, Any]] = []
+    for base, entries in grouped.items():
+        suffixes = {slot for slot, _armor in entries}
+        if len(suffixes) < 2:
+            collapsed.extend(armor for _slot, armor in entries)
+            continue
+        by_suffix = {slot: armor for slot, armor in entries}
+        template = dict(entries[0][1])
+        template["name"] = base
+        template["kind"] = template.get("kind") or "wearable"
+        new_items: Dict[str, str] = {}
+        for slot_key in SLOT_KEYS:
+            source = by_suffix.get(slot_key)
+            if isinstance(source, dict):
+                source_items = source.get("items") or {}
+                if isinstance(source_items, dict) and source_items.get(slot_key):
+                    new_items[slot_key] = source_items[slot_key]
+                    continue
+            for _suffix, candidate in entries:
+                source_items = candidate.get("items") or {}
+                if isinstance(source_items, dict) and source_items.get(slot_key):
+                    new_items[slot_key] = source_items[slot_key]
+                    break
+        if new_items:
+            template["items"] = new_items
+            collapsed.append(template)
+            repaired += 1
+        else:
+            collapsed.extend(armor for _slot, armor in entries)
+
+    # Preserve the original broad ordering: non-duplicated passthrough first,
+    # then repaired duplicate groups. This is stable enough for UI display and
+    # avoids losing any unusual entries.
+    return passthrough + collapsed, repaired
+
+
+def _summarize_ui_slot_mode(armors: List[Dict[str, Any]]) -> Tuple[str, str]:
+    wearable_sets: List[set[str]] = []
+    offhand_count = 0
+    for armor in armors:
+        if not isinstance(armor, dict):
+            continue
+        items = armor.get("items") or {}
+        if not isinstance(items, dict):
+            continue
+        keys = {k for k in items if k in _ARMOR_SLOT_SET}
+        if keys:
+            wearable_sets.append(keys)
+        if "offhand" in items or (armor.get("kind") == "offhand"):
+            offhand_count += 1
+    if not wearable_sets and offhand_count:
+        return "offhand", "มือซ้ายเท่านั้น"
+    if wearable_sets and all(keys == _ARMOR_SLOT_SET for keys in wearable_sets):
+        return "all", "ใส่ได้ทุกช่อง"
+    if wearable_sets and all(len(keys) == 1 for keys in wearable_sets):
+        return "original", "ช่องเดียว/คงช่องเดิม"
+    if wearable_sets:
+        return "custom", "กำหนดช่องเอง/ผสมหลายแบบ"
+    return "unknown", "ไม่พบข้อมูลช่อง"
+
+
+def _ui_config_to_inspection(src: Path, root: Path, bp: Path, rp: Path, script: Path, cfg: Dict[str, Any]) -> ExistingUiInspection:
+    armors = [a for a in cfg.get("armors", []) if isinstance(a, dict)]
+    mode, mode_label = _summarize_ui_slot_mode(armors)
+    items: List[Dict[str, Any]] = []
+    variant_count = 0
+    for idx, armor in enumerate(armors, start=1):
+        slot_items = armor.get("items") if isinstance(armor.get("items"), dict) else {}
+        slots = [k for k in ["head", "chest", "legs", "feet", "offhand"] if k in slot_items]
+        variant_count += len(slots)
+        items.append({
+            "entry_id": str(idx),
+            "name": str(armor.get("name") or f"Item {idx}"),
+            "kind": str(armor.get("kind") or ("offhand" if slots == ["offhand"] else "wearable")),
+            "slots": slots,
+            "slot_labels": ", ".join(_ui_slot_label(s) for s in slots) or "-",
+            "icon": armor.get("icon") or "",
+        })
+    return ExistingUiInspection(
+        source_path=str(src),
+        bp_dir=str(bp),
+        rp_dir=str(rp),
+        script_path=str(script.relative_to(root).as_posix()),
+        selector_id=str(cfg.get("menuItem") or ""),
+        ui_title=str(cfg.get("uiTitle") or "Addon UI"),
+        current_slot_mode=mode,
+        current_slot_mode_label=mode_label,
+        item_count=len(items),
+        item_variant_count=variant_count,
+        items=items,
+        repairable_duplicate_groups=_detect_duplicate_ui_groups(armors),
+    )
+
+
+def inspect_existing_ui_addon(addon_path: str, work_dir: str) -> Optional[ExistingUiInspection]:
+    """Return existing generated-UI information, or None for a normal addon."""
+    src = Path(addon_path)
+    root = Path(work_dir) / "ui_edit_inspect_src"
+    if root.exists():
+        shutil.rmtree(root)
+    _extract_addon_zip(src, root)
+    bp, rp = _find_packs(root)
+    script = _find_existing_ui_script(bp)
+    if not script:
+        return None
+    text = script.read_text(encoding="utf-8", errors="replace")
+    cfg, _, _ = _extract_json_const_from_js(text, "CONFIG")
+    return _ui_config_to_inspection(src, root, bp, rp, script, cfg)
+
+
+def _set_existing_ui_creative_visibility(bp: Path, selector_id: str, visible_item_ids: set[str]) -> None:
+    for item_path in (bp / "items").rglob("*.json") if (bp / "items").exists() else []:
+        try:
+            data = _read_json(item_path)
+            desc = data.get("minecraft:item", {}).get("description", {})
+        except Exception:
+            continue
+        item_id = desc.get("identifier")
+        if not item_id:
+            continue
+        if item_id == selector_id:
+            desc["menu_category"] = {"category": "equipment"}
+        elif item_id in visible_item_ids:
+            desc["menu_category"] = {"category": "none"}
+        _write_json(item_path, data)
+
+
+def edit_existing_ui_addon(
+    addon_path: str,
+    work_dir: str,
+    slot_mode: str = "keep",
+    custom_slots: Optional[List[str]] = None,
+    repair_duplicates: bool = False,
+) -> str:
+    """Edit a previously generated UI addon without converting hidden items again.
+
+    This intentionally edits the UI CONFIG only. It preserves existing files and
+    only changes which existing item variants are shown in the in-game menu.
+    """
+    src = Path(addon_path)
+    root = Path(work_dir) / "ui_edit_src"
+    if root.exists():
+        shutil.rmtree(root)
+    _extract_addon_zip(src, root)
+    bp, rp = _find_packs(root)
+    script = _find_existing_ui_script(bp)
+    if not script:
+        raise AddonError("ไฟล์นี้ไม่ใช่ addon UI ที่บอทเคยสร้างไว้ จึงใช้โหมดแก้ไขไม่ได้")
+    text = script.read_text(encoding="utf-8", errors="replace")
+    cfg, _, _ = _extract_json_const_from_js(text, "CONFIG")
+    armors = [a for a in cfg.get("armors", []) if isinstance(a, dict)]
+    warnings: List[str] = []
+    repaired = 0
+    if repair_duplicates:
+        armors, repaired = _collapse_duplicate_ui_armors(armors)
+        if repaired:
+            warnings.append(f"ซ่อมรายการที่น่าจะเกิดจากการทำ UI ซ้ำ {repaired} กลุ่ม")
+
+    mode = (slot_mode or "keep").lower()
+    allowed = [s for s in (custom_slots or []) if s in SLOT_KEYS]
+    new_armors: List[Dict[str, Any]] = []
+    for armor in armors:
+        items = armor.get("items") if isinstance(armor.get("items"), dict) else {}
+        kind = armor.get("kind") or ("offhand" if "offhand" in items else "wearable")
+        if kind == "offhand" or "offhand" in items:
+            new_armors.append(armor)
+            continue
+        if mode == "custom":
+            filtered = {slot: items[slot] for slot in allowed if slot in items}
+            if not filtered:
+                warnings.append(f"ซ่อน {armor.get('name', 'item')} จาก UI เพราะไม่มีช่องที่เลือก")
+                continue
+            armor = dict(armor)
+            armor["items"] = filtered
+        # keep/all intentionally keep every currently available slot. Existing UI
+        # addons do not always contain enough source data to safely synthesize new
+        # missing slots, so we never duplicate hidden items here.
+        new_armors.append(armor)
+
+    cfg["armors"] = new_armors
+    all_items: List[str] = []
+    for armor in new_armors:
+        items = armor.get("items") if isinstance(armor.get("items"), dict) else {}
+        for item_id in items.values():
+            if isinstance(item_id, str) and item_id:
+                all_items.append(item_id)
+    cfg["allItems"] = list(dict.fromkeys(all_items))
+    script.write_text(_replace_json_const_in_js(text, "CONFIG", cfg), encoding="utf-8")
+    _set_existing_ui_creative_visibility(bp, str(cfg.get("menuItem") or ""), set(cfg["allItems"]))
+
+    mode_label = {"keep": "คงสถานะเดิม", "all": "แสดงทุกช่องที่มีอยู่", "custom": "กำหนดช่องเอง"}.get(mode, mode)
+    report = [
+        "Existing UI Edit Mode report",
+        f"Source: {src.name}",
+        f"UI title: {cfg.get('uiTitle', '-')}",
+        f"Selector: {cfg.get('menuItem', '-')}",
+        f"Edit mode: {mode_label}",
+        f"Custom slots: {', '.join(allowed) if allowed else '-'}",
+        f"Menu entries: {len(new_armors)}",
+        f"Visible item variants in UI: {len(cfg['allItems'])}",
+    ]
+    if warnings:
+        report.extend(["", "Notes:"])
+        report.extend(f"- {w}" for w in warnings)
+    (Path(work_dir) / "UI_EDIT_REPORT_WEBHOOK.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
+
+    output_stem = src.stem
+    out_path = Path(work_dir) / f"edited_{output_stem}.mcaddon"
+    if out_path.exists():
+        out_path.unlink()
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                zf.write(path, path.relative_to(root).as_posix())
+    with zipfile.ZipFile(out_path, "r") as zf:
+        if not zf.namelist():
+            raise AddonError("สร้างไฟล์ output ไม่สำเร็จ")
+    return str(out_path)
 
 def inspect_addon(addon_path: str, work_dir: str) -> AddonInspection:
     src = Path(addon_path)
