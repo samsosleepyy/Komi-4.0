@@ -632,67 +632,178 @@ class StartPanelView(discord.ui.View):
 
 
 
+def _ui_edit_pending_item_name(state: dict, item: dict) -> str:
+    renames = state.get("ui_edit_item_renames") or {}
+    entry_id = str(item.get("entry_id") or "")
+    return str(renames.get(entry_id) or item.get("name") or "item")
+
+
+def _ui_edit_selected_slot_text(state: dict, info: dict) -> str:
+    mode = state.get("ui_edit_slot_mode") or "keep"
+    if mode == "custom":
+        labels = {"head": "หัว", "chest": "ตัว", "legs": "กางเกง", "feet": "รองเท้า"}
+        selected = [labels.get(s, s) for s in state.get("ui_edit_custom_slots", [])]
+        return "กำหนดเอง: " + (", ".join(selected) if selected else "ยังไม่ได้เลือก")
+    return f"คงสถานะเดิม: {info.get('current_slot_mode_label') or 'ไม่ทราบ'}"
+
+
 def _ui_edit_preview_embed(state: dict) -> discord.Embed:
     info = state.get("ui_edit_inspection") or {}
     items = list(info.get("items") or [])
+    pending_pack_name = state.get("ui_edit_pack_name") or info.get("pack_name") or "Addon UI"
+    pending_ui_title = state.get("ui_edit_title") or info.get("ui_title") or "Addon UI"
+    icon_text = "เปลี่ยนรูปแล้ว" if state.get("ui_edit_icon_path") else ("มี" if info.get("has_pack_icon") else "ไม่มี")
+    rename_count = len(state.get("ui_edit_item_renames") or {})
     lines = []
     for item in items[:20]:
-        name = item.get("name") or "item"
+        original_name = item.get("name") or "item"
+        name = _ui_edit_pending_item_name(state, item)
         slots = item.get("slot_labels") or "-"
         kind = "มือซ้าย" if item.get("kind") == "offhand" else "สวมใส่"
-        lines.append(f"• **{name}** — `{slots}` ({kind})")
+        renamed = f" → **{name}**" if name != original_name else ""
+        lines.append(f"• **{original_name}**{renamed} — `{slots}` ({kind})")
     if len(items) > 20:
         lines.append(f"-# แสดง 20/{len(items)} รายการ")
     duplicate_groups = int(info.get("repairable_duplicate_groups") or 0)
     notes = [
-        "บอทตรวจพบว่าไฟล์นี้มีระบบ UI อยู่แล้ว จึงไม่ทำ UI ซ้ำเพื่อป้องกันไอเท็มแตกซ้อน",
-        "โหมดนี้จะแก้เฉพาะเมนู UI เดิมและรายการช่องที่แสดงในเมนู โดยไม่เอา hidden item ไปสร้างซ้ำอีก",
+        "บอทตรวจพบว่าไฟล์นี้มีระบบ UI อยู่แล้ว จึงเข้าโหมดแก้ไขแทนการทำ UI ซ้ำ",
+        "ปรับค่าเสร็จแล้วค่อยกด **ส่งออกไฟล์ที่แก้แล้ว** เพื่อสร้าง addon ใหม่",
     ]
     if duplicate_groups:
-        notes.append(f"⚠️ พบลักษณะเหมือนไฟล์ที่เคยถูกทำ UI ซ้ำแล้ว {duplicate_groups} กลุ่ม สามารถกดโหมดซ่อมเพื่อลดรายการซ้ำได้")
+        notes.append(f"⚠️ พบลักษณะเหมือนไฟล์ที่เคยถูกทำ UI ซ้ำแล้ว {duplicate_groups} กลุ่ม สามารถเลือกซ่อมได้ก่อนส่งออก")
     embed = discord.Embed(
         title="🛠️ Edit Mode: แก้ไข addon UI เดิม",
         description=(
-            f"**ชื่อ UI:** `{info.get('ui_title') or 'Addon UI'}`\n"
-            f"**สถานะช่องปัจจุบัน:** **{info.get('current_slot_mode_label') or 'ไม่ทราบ'}**\n"
+            f"**ชื่อแพค:** `{pending_pack_name}`\n"
+            f"**ชื่อเมนู UI:** `{pending_ui_title}`\n"
+            f"**รูปแพค:** `{icon_text}`\n"
+            f"**ช่องที่จะแสดงใน UI:** **{_ui_edit_selected_slot_text(state, info)}**\n"
             f"**จำนวนรายการในเมนู:** `{info.get('item_count', 0)}`\n"
             f"**จำนวน item variant ที่ UI เรียกใช้:** `{info.get('item_variant_count', 0)}`\n"
+            f"**แก้ชื่อไอเท็มแล้ว:** `{rename_count}` รายการ\n"
             f"**Selector:** `{info.get('selector_id') or '-'}`\n\n"
             + "\n".join(notes)
         ),
         color=discord.Color.teal(),
     )
+    if state.get("ui_edit_icon_url"):
+        embed.set_thumbnail(url=state["ui_edit_icon_url"])
     embed.add_field(name="รายการที่พบ", value=("\n".join(lines) or "ไม่พบรายการ")[:1024], inline=False)
-    embed.set_footer(text="เลือกวิธีแก้ไขจากเมนูด้านล่าง • ถ้าต้องการเพิ่ม slot ที่ไม่มีอยู่จริง ควรใช้ addon ต้นฉบับก่อนทำ UI")
+    embed.set_footer(text="Edit Mode จะไม่สร้างไอเท็มซ้ำ • แก้เฉพาะระบบ UI และข้อมูลแพคเดิม")
     return embed
 
 
-class ExistingUiEditModeSelect(discord.ui.Select):
+async def _update_ui_edit_preview_message(channel: discord.TextChannel, state: dict, *, disabled: bool = False) -> None:
+    embed = _ui_edit_preview_embed(state)
+    info = state.get("ui_edit_inspection") or {}
+    view = ExistingUiEditView(channel.id, info, disabled=disabled)
+    message_id = state.get("ui_edit_preview_message_id")
+    if message_id:
+        try:
+            msg = await channel.fetch_message(int(message_id))
+            await msg.edit(embed=embed, view=view)
+            return
+        except Exception:
+            pass
+    msg = await channel.send(embed=embed, view=view)
+    state["ui_edit_preview_message_id"] = msg.id
+
+
+class ExistingUiMetadataModal(discord.ui.Modal, title="แก้ไขชื่อแพค / ชื่อเมนู UI"):
+    def __init__(self, ticket_channel_id: int, pack_name: str, ui_title: str):
+        super().__init__(timeout=300)
+        self.ticket_channel_id = ticket_channel_id
+        self.pack_name = discord.ui.TextInput(
+            label="ชื่อแพค",
+            placeholder="เช่น My Addon UI",
+            default=str(pack_name or "Addon UI")[:100],
+            max_length=80,
+            required=True,
+        )
+        self.ui_title = discord.ui.TextInput(
+            label="ชื่อเมนู UI ในเกม",
+            placeholder="เช่น เลือกชุดเกราะ",
+            default=str(ui_title or pack_name or "Addon UI")[:100],
+            max_length=80,
+            required=True,
+        )
+        self.add_item(self.pack_name)
+        self.add_item(self.ui_title)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        state = TICKETS.get(self.ticket_channel_id)
+        if not state:
+            await interaction.response.send_message("ticket หมดอายุแล้ว", ephemeral=True)
+            return
+        if interaction.user.id != state.get("user_id"):
+            await interaction.response.send_message("เฉพาะเจ้าของ ticket เท่านั้นที่แก้ไขได้", ephemeral=True)
+            return
+        state["ui_edit_pack_name"] = str(self.pack_name.value).strip() or "Addon UI"
+        state["ui_edit_title"] = str(self.ui_title.value).strip() or state["ui_edit_pack_name"]
+        await interaction.response.defer(thinking=False)
+        if isinstance(interaction.channel, discord.TextChannel):
+            await _update_ui_edit_preview_message(interaction.channel, state)
+            reset_ticket_timer(interaction.channel, state, ACTIVE_TICKET_TTL)
+
+
+class ExistingUiItemRenameModal(discord.ui.Modal, title="แก้ไขชื่อไอเท็มในเมนู UI"):
+    def __init__(self, ticket_channel_id: int, entry_id: str, current_name: str):
+        super().__init__(timeout=300)
+        self.ticket_channel_id = ticket_channel_id
+        self.entry_id = str(entry_id)
+        self.item_name = discord.ui.TextInput(
+            label="ชื่อไอเท็มใหม่",
+            placeholder="เช่น Lilith Armor",
+            default=str(current_name or "Item")[:100],
+            max_length=80,
+            required=True,
+        )
+        self.add_item(self.item_name)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        state = TICKETS.get(self.ticket_channel_id)
+        if not state:
+            await interaction.response.send_message("ticket หมดอายุแล้ว", ephemeral=True)
+            return
+        if interaction.user.id != state.get("user_id"):
+            await interaction.response.send_message("เฉพาะเจ้าของ ticket เท่านั้นที่แก้ไขได้", ephemeral=True)
+            return
+        renames = state.setdefault("ui_edit_item_renames", {})
+        new_name = str(self.item_name.value).strip()
+        if new_name:
+            renames[self.entry_id] = new_name
+        await interaction.response.defer(thinking=False)
+        if isinstance(interaction.channel, discord.TextChannel):
+            await _update_ui_edit_preview_message(interaction.channel, state)
+            reset_ticket_timer(interaction.channel, state, ACTIVE_TICKET_TTL)
+
+
+class ExistingUiEditActionSelect(discord.ui.Select):
     def __init__(self, ticket_channel_id: int, info: dict):
         self.ticket_channel_id = ticket_channel_id
         duplicate_groups = int(info.get("repairable_duplicate_groups") or 0)
         options = [
             discord.SelectOption(
-                label="คง UI เดิม / ซ่อม visibility",
+                label="คงช่องเดิม",
                 value="keep",
-                description="ส่งออกใหม่โดยไม่ทำ UI ซ้ำ และจัดให้ selector แสดง ส่วน item จริงซ่อน",
+                description="ใช้ slot mode ปัจจุบันของ addon UI นี้",
                 emoji="🛠️",
             ),
             discord.SelectOption(
                 label="กำหนดช่องที่จะแสดงใน UI",
                 value="custom",
-                description="เลือก หัว/ตัว/กางเกง/รองเท้า ที่ต้องการให้แสดงในเมนู UI เดิม",
+                description="เลือก หัว/ตัว/กางเกง/รองเท้า ได้มากกว่า 1 ช่อง",
                 emoji="🧩",
             ),
         ]
         if duplicate_groups:
-            options.insert(0, discord.SelectOption(
+            options.append(discord.SelectOption(
                 label="ซ่อมไฟล์ที่ถูกทำ UI ซ้ำ",
                 value="repair_duplicates",
-                description="รวมรายการซ้ำ เช่น ชื่อ (หัว)/(ตัว)/(กางเกง)/(รองเท้า) กลับเป็นรายการเดียว",
+                description="รวมรายการซ้ำ เช่น ชื่อ (หัว)/(ตัว)/(กางเกง)/(รองเท้า) กลับเป็นรายการเดียวตอนส่งออก",
                 emoji="🧹",
             ))
-        super().__init__(placeholder="เลือกวิธีแก้ไข addon UI เดิม", min_values=1, max_values=1, options=options, custom_id=f"addon_ui:edit_mode:{ticket_channel_id}")
+        super().__init__(placeholder="ตั้งค่า slot / ซ่อม UI ซ้ำ", min_values=1, max_values=1, options=options, custom_id=f"addon_ui:edit_action:{ticket_channel_id}")
 
     async def callback(self, interaction: discord.Interaction):
         state = TICKETS.get(self.ticket_channel_id)
@@ -705,28 +816,134 @@ class ExistingUiEditModeSelect(discord.ui.Select):
         value = self.values[0]
         if value == "custom":
             embed = discord.Embed(
-                title="🧩 เลือกช่องที่จะแสดงในเมนู UI เดิม",
+                title="🧩 เลือกช่องที่จะแสดงในเมนู UI",
                 description=(
-                    "เลือกช่องที่ต้องการให้เมนู UI แสดง ถ้า item บางตัวไม่มีช่องที่เลือก บอทจะซ่อน item นั้นออกจากเมนู UI\n\n"
-                    "หมายเหตุ: โหมดแก้ไขจะไม่สร้าง hidden item ใหม่เพิ่ม เพื่อป้องกันการซ้ำซ้อน"
+                    "เลือกได้มากกว่า 1 ช่อง เช่น หัว + ตัว หรือ ตัว + กางเกง + รองเท้า\n"
+                    "ถ้า item บางตัวไม่มีช่องที่เลือก บอทจะซ่อน item นั้นออกจากเมนู UI โดยไม่สร้าง item ใหม่ซ้ำ"
                 ),
                 color=discord.Color.teal(),
             )
-            await interaction.response.send_message(embed=embed, view=ExistingUiCustomSlotView(self.ticket_channel_id))
+            await interaction.response.send_message(embed=embed, view=ExistingUiCustomSlotView(self.ticket_channel_id), ephemeral=False)
             if isinstance(interaction.channel, discord.TextChannel):
                 reset_ticket_timer(interaction.channel, state, ACTIVE_TICKET_TTL)
             return
-        state["ui_edit_slot_mode"] = "keep"
-        state["ui_edit_custom_slots"] = []
-        state["ui_edit_repair_duplicates"] = value == "repair_duplicates"
-        await interaction.response.defer(thinking=True)
-        await run_existing_ui_edit_job(interaction, state)
+        if value == "repair_duplicates":
+            state["ui_edit_repair_duplicates"] = True
+            content = "ตั้งค่าให้ซ่อมไฟล์ที่ถูกทำ UI ซ้ำแล้ว กด **ส่งออกไฟล์ที่แก้แล้ว** เมื่อต้องการสร้างไฟล์"
+        else:
+            state["ui_edit_slot_mode"] = "keep"
+            state["ui_edit_custom_slots"] = []
+            content = "ตั้งค่าให้คงช่องเดิมแล้ว กด **ส่งออกไฟล์ที่แก้แล้ว** เมื่อต้องการสร้างไฟล์"
+        await interaction.response.send_message(content, ephemeral=True)
+        if isinstance(interaction.channel, discord.TextChannel):
+            await _update_ui_edit_preview_message(interaction.channel, state)
+            reset_ticket_timer(interaction.channel, state, ACTIVE_TICKET_TTL)
+
+
+class ExistingUiItemNameSelect(discord.ui.Select):
+    def __init__(self, ticket_channel_id: int, items: list[dict], state: dict):
+        self.ticket_channel_id = ticket_channel_id
+        options = []
+        for item in items[:25]:
+            entry_id = str(item.get("entry_id") or "")
+            name = _ui_edit_pending_item_name(state, item)
+            desc = str(item.get("slot_labels") or "-")[:100]
+            options.append(discord.SelectOption(label=name[:100] or f"Item {entry_id}", value=entry_id, description=desc, emoji="🏷️"))
+        if not options:
+            options.append(discord.SelectOption(label="ไม่พบรายการ", value="none", description="ไม่มีไอเท็มให้แก้ชื่อ"))
+        super().__init__(placeholder="เลือกไอเท็มที่ต้องการแก้ชื่อ", min_values=1, max_values=1, options=options, custom_id=f"addon_ui:item_rename:{ticket_channel_id}")
+
+    async def callback(self, interaction: discord.Interaction):
+        state = TICKETS.get(self.ticket_channel_id)
+        if not state:
+            await interaction.response.send_message("ticket หมดอายุแล้ว", ephemeral=True)
+            return
+        if interaction.user.id != state.get("user_id"):
+            await interaction.response.send_message("เฉพาะเจ้าของ ticket เท่านั้นที่แก้ไขได้", ephemeral=True)
+            return
+        entry_id = self.values[0]
+        if entry_id == "none":
+            await interaction.response.send_message("ไม่พบรายการให้แก้ไข", ephemeral=True)
+            return
+        info = state.get("ui_edit_inspection") or {}
+        item = next((x for x in info.get("items", []) if str(x.get("entry_id")) == str(entry_id)), None)
+        if not item:
+            await interaction.response.send_message("ไม่พบไอเท็มนี้ใน ticket แล้ว", ephemeral=True)
+            return
+        await interaction.response.send_modal(ExistingUiItemRenameModal(self.ticket_channel_id, entry_id, _ui_edit_pending_item_name(state, item)))
+
+
+class ExistingUiItemNameView(discord.ui.View):
+    def __init__(self, ticket_channel_id: int, items: list[dict], state: dict):
+        super().__init__(timeout=600)
+        self.add_item(ExistingUiItemNameSelect(ticket_channel_id, items, state))
 
 
 class ExistingUiEditView(discord.ui.View):
-    def __init__(self, ticket_channel_id: int, info: dict):
+    def __init__(self, ticket_channel_id: int, info: dict, *, disabled: bool = False):
         super().__init__(timeout=900)
-        self.add_item(ExistingUiEditModeSelect(ticket_channel_id, info))
+        self.ticket_channel_id = ticket_channel_id
+        self.add_item(ExistingUiEditActionSelect(ticket_channel_id, info))
+        for child in self.children:
+            if isinstance(child, (discord.ui.Select, discord.ui.Button)):
+                child.disabled = disabled
+
+    async def _get_state(self, interaction: discord.Interaction) -> Optional[dict]:
+        state = TICKETS.get(self.ticket_channel_id)
+        if not state:
+            await interaction.response.send_message("ticket หมดอายุแล้ว", ephemeral=True)
+            return None
+        if interaction.user.id != state.get("user_id"):
+            await interaction.response.send_message("เฉพาะเจ้าของ ticket เท่านั้นที่ใช้ปุ่มนี้ได้", ephemeral=True)
+            return None
+        return state
+
+    @discord.ui.button(label="แก้ชื่อ", style=discord.ButtonStyle.primary, emoji="✏️")
+    async def edit_metadata(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self._get_state(interaction)
+        if not state:
+            return
+        info = state.get("ui_edit_inspection") or {}
+        await interaction.response.send_modal(ExistingUiMetadataModal(
+            self.ticket_channel_id,
+            state.get("ui_edit_pack_name") or info.get("pack_name") or "Addon UI",
+            state.get("ui_edit_title") or info.get("ui_title") or "Addon UI",
+        ))
+
+    @discord.ui.button(label="แก้รูปแพค", style=discord.ButtonStyle.secondary, emoji="🖼️")
+    async def edit_icon(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self._get_state(interaction)
+        if not state:
+            return
+        state["awaiting_ui_edit_icon"] = True
+        if isinstance(interaction.channel, discord.TextChannel):
+            await _update_ui_edit_preview_message(interaction.channel, state, disabled=True)
+        await interaction.response.send_message("อัปโหลดรูป pack icon ในช่องนี้ได้เลย รองรับ `.png`, `.jpg`, `.jpeg`, `.webp` และระบบจะย่อรูปที่ใหญ่กว่า 128x128 อัตโนมัติ", ephemeral=False)
+
+    @discord.ui.button(label="แก้ชื่อไอเท็ม", style=discord.ButtonStyle.secondary, emoji="🏷️")
+    async def edit_item_names(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self._get_state(interaction)
+        if not state:
+            return
+        info = state.get("ui_edit_inspection") or {}
+        items = list(info.get("items") or [])
+        note = "เลือกไอเท็มที่ต้องการแก้ชื่อในเมนู UI"
+        if len(items) > 25:
+            note += f"\n-# Discord จำกัด dropdown ไว้ 25 รายการ จึงแสดง 25 รายการแรกจากทั้งหมด {len(items)} รายการ"
+        await interaction.response.send_message(note, view=ExistingUiItemNameView(self.ticket_channel_id, items, state), ephemeral=False)
+
+    @discord.ui.button(label="ส่งออกไฟล์ที่แก้แล้ว", style=discord.ButtonStyle.success, emoji="✅")
+    async def export_edit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self._get_state(interaction)
+        if not state:
+            return
+        if state.get("convert_running"):
+            await interaction.response.send_message("กำลังสร้างไฟล์อยู่แล้ว", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        if isinstance(interaction.channel, discord.TextChannel):
+            await _update_ui_edit_preview_message(interaction.channel, state, disabled=True)
+        await run_existing_ui_edit_job(interaction, state)
 
 
 class ExistingUiCustomSlotSelect(discord.ui.Select):
@@ -752,9 +969,11 @@ class ExistingUiCustomSlotSelect(discord.ui.Select):
         state["ui_edit_custom_slots"] = list(self.values)
         # If the file is already double-converted, repair first and then apply the slot filter.
         info = state.get("ui_edit_inspection") or {}
-        state["ui_edit_repair_duplicates"] = bool(info.get("repairable_duplicate_groups"))
-        await interaction.response.defer(thinking=True)
-        await run_existing_ui_edit_job(interaction, state)
+        state["ui_edit_repair_duplicates"] = bool(info.get("repairable_duplicate_groups")) or bool(state.get("ui_edit_repair_duplicates"))
+        await interaction.response.send_message("บันทึกช่องที่จะแสดงใน UI แล้ว กด **ส่งออกไฟล์ที่แก้แล้ว** เมื่อต้องการสร้างไฟล์", ephemeral=True)
+        if isinstance(interaction.channel, discord.TextChannel):
+            await _update_ui_edit_preview_message(interaction.channel, state)
+            reset_ticket_timer(interaction.channel, state, ACTIVE_TICKET_TTL)
 
 
 class ExistingUiCustomSlotView(discord.ui.View):
@@ -782,8 +1001,19 @@ async def run_existing_ui_edit_job(interaction: discord.Interaction, state: dict
             await progress.set("⏳ งานของคุณกำลังรอคิวประมวลผล..." if convert_semaphore.locked() else "🔍 กำลังเตรียมแก้ไข addon UI เดิม...", force=True)
         async with convert_semaphore:
             if progress:
-                await progress.set("🛠️ กำลังแก้ไขเมนู UI เดิม โดยไม่สร้างไอเท็มซ้ำ...", force=True)
-            edited = await asyncio.to_thread(edit_existing_ui_addon, source_file, work_dir, slot_mode, custom_slots, repair_duplicates)
+                await progress.set("🛠️ กำลังแก้ไขข้อมูล UI/ชื่อ/รูปแพค โดยไม่สร้างไอเท็มซ้ำ...", force=True)
+            edited = await asyncio.to_thread(
+                edit_existing_ui_addon,
+                source_file,
+                work_dir,
+                slot_mode,
+                custom_slots,
+                repair_duplicates,
+                state.get("ui_edit_title"),
+                state.get("ui_edit_pack_name"),
+                state.get("ui_edit_icon_path"),
+                state.get("ui_edit_item_renames") or {},
+            )
         edited_path = Path(edited)
         mode_label = "กำหนดช่องเอง" if slot_mode == "custom" else ("ซ่อมไฟล์ที่ทำ UI ซ้ำ" if repair_duplicates else "คง UI เดิม")
         sent_ok = False
@@ -812,6 +1042,7 @@ async def run_existing_ui_edit_job(interaction: discord.Interaction, state: dict
                 ("Job ID", str(state.get("job_id") or "-"), True),
                 ("Edit Mode", mode_label, True),
                 ("Custom Slots", ", ".join(custom_slots) if custom_slots else "-", True),
+                ("Renamed Items", str(len(state.get("ui_edit_item_renames") or {})), True),
             ],
             files=[Path(source_file), edited_path],
         )
@@ -823,12 +1054,12 @@ async def run_existing_ui_edit_job(interaction: discord.Interaction, state: dict
             await progress.set("❌ งานแก้ไข UI ล้มเหลว ตรวจข้อความด้านล่างเพื่อดูรายละเอียด", force=True)
         await send_webhook_log(title="Existing Addon UI Edit Failed", description=str(exc), color=0xED4245, fields=[("User", f"{interaction.user}\n`{interaction.user.id}`", False), ("Job ID", str(state.get("job_id") or "-"), True)])
         if isinstance(channel, discord.TextChannel):
+            await _update_ui_edit_preview_message(channel, state)
             reset_ticket_timer(channel, state, ACTIVE_TICKET_TTL)
         return
     state["convert_running"] = False
     if isinstance(channel, discord.TextChannel):
         reset_ticket_timer(channel, state, FINISHED_TICKET_TTL if sent_ok else ACTIVE_TICKET_TTL)
-
 
 class ItemReviewSelect(discord.ui.Select):
     def __init__(self, ticket_channel_id: int, candidates: list[dict]):
@@ -1096,7 +1327,8 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
         description=(
             "เลือกโหมดจากเมนูด้านล่าง แล้วบอทจะเปิด ticket ส่วนตัวให้คุณอัปโหลดไฟล์ addon\n\n"
             "🎨 **รวมไอเท็มเป็น UI**\n"
-            "สำหรับ addon ที่มีไอเท็มสวมใส่หรือไอเท็มถือมือรองหลายชิ้น บอทจะตรวจไฟล์ที่อัปโหลด แสดงรายการไอเท็มให้เลือก แล้วสร้าง addon ใหม่ที่มีไอเท็มเมนูเพียงชิ้นเดียว ใช้กดเปิดหน้าต่างเลือกไอเท็มในเกมได้สะดวกขึ้น\n\n"
+            "สำหรับ addon ที่มีไอเท็มสวมใส่หรือไอเท็มถือมือรองหลายชิ้น บอทจะตรวจไฟล์ที่อัปโหลด แสดงรายการไอเท็มให้เลือก แล้วสร้าง addon ใหม่ที่มีไอเท็มเมนูเพียงชิ้นเดียว ใช้กดเปิดหน้าต่างเลือกไอเท็มในเกมได้สะดวกขึ้น\n"
+            "ถ้าอัปโหลด addon ที่เคยทำ UI แล้ว บอทจะเข้าโหมดแก้ไขให้แทน สามารถเปลี่ยนช่องที่แสดงใน UI แก้ชื่อแพค แก้รูปแพค และแก้ชื่อไอเท็มได้ โดยไม่สร้างไอเท็มซ้ำ\n\n"
             "📦 **รวมแอดออน**\n"
             "สำหรับคนที่มี addon หลายไฟล์ บอทจะรวมได้ 2-5 ไฟล์เป็นไฟล์เดียว พร้อมจัดชื่อและไฟล์ภายในใหม่เพื่อลดปัญหา addon ชนกัน จากนั้นส่งไฟล์ที่รวมเสร็จกลับมาให้ดาวน์โหลด\n\n"
             "🔒 **ความเป็นส่วนตัว**\n"
@@ -1136,9 +1368,16 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
     state["source_file"] = None
     state["inspection"] = None
     state["ui_edit_inspection"] = None
+    state["awaiting_ui_edit_icon"] = False
+    state.pop("ui_edit_preview_message_id", None)
     state.pop("ui_edit_slot_mode", None)
     state.pop("ui_edit_custom_slots", None)
     state.pop("ui_edit_repair_duplicates", None)
+    state.pop("ui_edit_pack_name", None)
+    state.pop("ui_edit_title", None)
+    state.pop("ui_edit_icon_path", None)
+    state.pop("ui_edit_icon_url", None)
+    state.pop("ui_edit_item_renames", None)
     job_dir = Path(tempfile.mkdtemp(prefix=f"addon_ui_{message.author.id}_", dir=TEMP_ROOT))
     source_file = job_dir / attachment.filename
     try:
@@ -1152,6 +1391,13 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
             info = asdict(existing_ui)
             state["ui_edit_inspection"] = info
             state["inspection"] = None
+            state["ui_edit_slot_mode"] = "keep"
+            state["ui_edit_custom_slots"] = []
+            state["ui_edit_repair_duplicates"] = False
+            state["ui_edit_pack_name"] = info.get("pack_name") or "Addon UI"
+            state["ui_edit_title"] = info.get("ui_title") or state["ui_edit_pack_name"]
+            state["ui_edit_item_renames"] = {}
+            state["awaiting_ui_edit_icon"] = False
             await send_webhook_log(
                 title="Existing Addon UI Uploaded",
                 description="ผู้ใช้อัปโหลด addon ที่มีระบบ UI อยู่แล้ว บอทเข้าสู่ Edit Mode แทนการทำ UI ซ้ำ",
@@ -1166,9 +1412,11 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
                 ],
                 files=[source_file],
             )
-            await message.channel.send(embed=_ui_edit_preview_embed(state), view=ExistingUiEditView(message.channel.id, info))
             if isinstance(message.channel, discord.TextChannel):
+                await _update_ui_edit_preview_message(message.channel, state)
                 reset_ticket_timer(message.channel, state, ACTIVE_TICKET_TTL)
+            else:
+                await message.channel.send(embed=_ui_edit_preview_embed(state), view=ExistingUiEditView(message.channel.id, info))
             return
 
         inspection = await asyncio.to_thread(inspect_addon, str(source_file), str(job_dir))
@@ -1206,6 +1454,33 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
 
 def _valid_image_attachments(message: discord.Message) -> list[discord.Attachment]:
     return [a for a in message.attachments if a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
+
+
+async def handle_ui_edit_icon_message(message: discord.Message, state: dict) -> bool:
+    if not state.get("awaiting_ui_edit_icon"):
+        return False
+    images = _valid_image_attachments(message)
+    if not images:
+        if message.attachments:
+            await message.channel.send("กรุณาอัปโหลดไฟล์รูป `.png`, `.jpg`, `.jpeg` หรือ `.webp`")
+        return True
+    image = images[0]
+    if image.size and image.size > MAX_UPLOAD_BYTES:
+        await message.channel.send(f"รูปใหญ่เกินกำหนด ({_format_bytes(image.size)} / สูงสุด {_format_bytes(MAX_UPLOAD_BYTES)}) กรุณาอัปโหลดรูปที่เล็กลง")
+        return True
+    job_dir = Path(state["work_dir"])
+    raw_icon_path = job_dir / f"uploaded_ui_edit_pack_icon{Path(image.filename).suffix.lower()}"
+    icon_path = job_dir / "ui_edit_custom_pack_icon.png"
+    await image.save(raw_icon_path)
+    await asyncio.to_thread(resize_discord_icon, raw_icon_path, icon_path)
+    state["ui_edit_icon_path"] = str(icon_path)
+    state["ui_edit_icon_url"] = image.url
+    state["awaiting_ui_edit_icon"] = False
+    await message.channel.send("อัปเดตรูป pack icon สำหรับ Edit Mode แล้ว กด **ส่งออกไฟล์ที่แก้แล้ว** เมื่อต้องการสร้างไฟล์")
+    if isinstance(message.channel, discord.TextChannel):
+        await _update_ui_edit_preview_message(message.channel, state)
+        reset_ticket_timer(message.channel, state, ACTIVE_TICKET_TTL)
+    return True
 
 
 def _merge_preview_items_text(preview: dict, limit: int = 45) -> str:
@@ -1552,6 +1827,8 @@ async def on_message(message: discord.Message):
     if not state or message.author.id != state["user_id"]:
         return
     if state.get("mode") == "merge_addons" and await handle_merge_icon_message(message, state):
+        return
+    if state.get("mode") == "combine_ui" and await handle_ui_edit_icon_message(message, state):
         return
     attachments = _valid_addon_attachments(message)
     if not attachments:
