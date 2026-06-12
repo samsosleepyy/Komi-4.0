@@ -54,9 +54,9 @@ def _slot_keys_for_candidate(candidate: "AddonItemCandidate", slot_mode: str = "
 
 TEXTURE_EXTS = (".png", ".tga", ".jpg", ".jpeg", ".webp")
 ICON_SIZE = 128
-MAX_ZIP_MEMBERS = int(os.getenv("MAX_ZIP_MEMBERS", "3000"))
-MAX_ZIP_UNCOMPRESSED_BYTES = int(os.getenv("MAX_ZIP_UNCOMPRESSED_BYTES", str(250 * 1024 * 1024)))
-MAX_ZIP_SINGLE_FILE_BYTES = int(os.getenv("MAX_ZIP_SINGLE_FILE_BYTES", str(80 * 1024 * 1024)))
+MAX_ZIP_MEMBERS = int(os.getenv("MAX_ZIP_MEMBERS", "2000"))
+MAX_ZIP_UNCOMPRESSED_BYTES = int(os.getenv("MAX_ZIP_UNCOMPRESSED_BYTES", str(150 * 1024 * 1024)))
+MAX_ZIP_SINGLE_FILE_BYTES = int(os.getenv("MAX_ZIP_SINGLE_FILE_BYTES", str(50 * 1024 * 1024)))
 MAX_ZIP_MEMBER_NAME_LENGTH = int(os.getenv("MAX_ZIP_MEMBER_NAME_LENGTH", "240"))
 
 
@@ -195,6 +195,37 @@ def _safe_extract(zip_path: Path, out_dir: Path) -> None:
                     shutil.copyfileobj(src, dst)
 
 
+def _extract_addon_zip(zip_path: Path, out_dir: Path) -> None:
+    """Extract an addon and unwrap one common nested-zip layer if needed.
+
+    Users sometimes upload a .zip that contains a single .mcaddon/.zip inside.
+    We only unwrap one nested archive and still apply the same safe extraction
+    limits, so this stays cheap enough for free Render deployments.
+    """
+    _safe_extract(zip_path, out_dir)
+    try:
+        _find_packs(out_dir)
+        return
+    except AddonError as first_error:
+        nested_archives = [
+            p for p in out_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in {".mcaddon", ".zip"} and zipfile.is_zipfile(p)
+        ]
+        if len(nested_archives) != 1:
+            raise first_error
+        nested_root = out_dir.parent / f"{out_dir.name}_nested"
+        if nested_root.exists():
+            shutil.rmtree(nested_root)
+        try:
+            _safe_extract(nested_archives[0], nested_root)
+            _find_packs(nested_root)
+        except Exception:
+            shutil.rmtree(nested_root, ignore_errors=True)
+            raise first_error
+        shutil.rmtree(out_dir, ignore_errors=True)
+        shutil.move(str(nested_root), str(out_dir))
+
+
 def _find_packs(root: Path) -> Tuple[Path, Path]:
     bp: Optional[Path] = None
     rp: Optional[Path] = None
@@ -292,7 +323,7 @@ def inspect_addon(addon_path: str, work_dir: str) -> AddonInspection:
     root = Path(work_dir) / "inspect"
     if root.exists():
         shutil.rmtree(root)
-    _safe_extract(src, root)
+    _extract_addon_zip(src, root)
     bp, rp = _find_packs(root)
     candidates = _scan_candidates(root, bp)
     if not candidates:
@@ -1087,7 +1118,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
 
     Instead of patching the uploaded addon in-place, this extracts only wearable item
     metadata, attachables, geometry, animations, render controllers, textures and lang
-    labels, then rebuilds a clean Seraphim-style BP/RP with one visible UI item.
+    labels, then rebuilds a clean BP/RP with one visible UI item.
     """
     src = Path(addon_path)
     root = Path(work_dir) / "convert_src"
@@ -1096,7 +1127,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
         shutil.rmtree(root)
     if out_root.exists():
         shutil.rmtree(out_root)
-    _safe_extract(src, root)
+    _extract_addon_zip(src, root)
     src_bp, src_rp = _find_packs(root)
     candidates = _scan_candidates(root, src_bp)
     selected = [c for c in candidates if c.identifier in set(selected_identifiers)]

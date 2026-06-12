@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from uuid import uuid4
 
-from .pipeline import AddonError, _find_packs, _read_json, _safe_extract, _safe_id, _write_json, _resize_image_file, _resize_item_icon_tree, _write_resized_icon
+from .pipeline import AddonError, _extract_addon_zip, _find_packs, _read_json, _safe_extract, _safe_id, _write_json, _resize_image_file, _resize_item_icon_tree, _write_resized_icon
 
 TEXT_EXTS = {'.json', '.js', '.mcfunction', '.lang', '.txt'}
 IMAGE_EXTS = {'.png', '.tga', '.jpg', '.jpeg', '.webp'}
@@ -272,7 +272,7 @@ def _collect_ui_hidden_item_ids(bp: Path, mapping: Dict[str, str]) -> Set[str]:
 
 def _collect_source_pack(source_path: Path, extract_parent: Path, index: int) -> SourcePack:
     extract_root = extract_parent / f'source_{index}'
-    _safe_extract(source_path, extract_root)
+    _extract_addon_zip(source_path, extract_root)
     bp, rp = _find_packs(extract_root)
     fallback = _safe_id(source_path.stem, f'addon{index}')
     display = _pack_display_name(bp, rp, fallback)
@@ -665,7 +665,7 @@ def inspect_merge_addons(addon_paths: List[str], work_dir: str) -> Dict[str, Any
         if not path.exists() or not zipfile.is_zipfile(path):
             raise AddonError(f'ไฟล์ไม่ใช่ addon/zip ที่เปิดได้: {path.name}')
         extract_root = preview_root / f'source_{index}'
-        _safe_extract(path, extract_root)
+        _extract_addon_zip(path, extract_root)
         bp, rp = _find_packs(extract_root)
         bp_manifest = _read_json(bp / 'manifest.json')
         rp_manifest = _read_json(rp / 'manifest.json')
