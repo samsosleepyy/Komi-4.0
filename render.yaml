@@ -15,3 +15,19 @@ services:
         value: "1420339720277463112,1441795602550882334"
       - key: MAX_PARALLEL_JOBS
         value: "1"
+      - key: MAX_UPLOAD_BYTES
+        value: "26214400"
+      - key: MAX_MERGE_TOTAL_UPLOAD_BYTES
+        value: "78643200"
+      - key: DISCORD_UPLOAD_LIMIT_BYTES
+        value: "26214400"
+      - key: MAX_ZIP_MEMBERS
+        value: "2000"
+      - key: MAX_ZIP_UNCOMPRESSED_BYTES
+        value: "157286400"
+      - key: MAX_ZIP_SINGLE_FILE_BYTES
+        value: "52428800"
+      - key: PROGRESS_UPDATE_INTERVAL
+        value: "10"
+      - key: TEMP_MAX_AGE_HOURS
+        value: "6"

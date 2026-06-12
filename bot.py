@@ -23,7 +23,15 @@ except Exception:
 from discord import app_commands
 from discord.ext import commands
 
-from addon_processor import AddonError, convert_addon, inspect_addon, inspect_merge_addons, merge_addons
+from addon_processor import (
+    AddonError,
+    convert_addon,
+    edit_existing_ui_addon,
+    inspect_addon,
+    inspect_existing_ui_addon,
+    inspect_merge_addons,
+    merge_addons,
+)
 
 ROOT = Path(__file__).parent
 TEMP_ROOT = ROOT / "temp"
@@ -623,6 +631,205 @@ class StartPanelView(discord.ui.View):
         self.add_item(PanelModeSelect())
 
 
+
+def _ui_edit_preview_embed(state: dict) -> discord.Embed:
+    info = state.get("ui_edit_inspection") or {}
+    items = list(info.get("items") or [])
+    lines = []
+    for item in items[:20]:
+        name = item.get("name") or "item"
+        slots = item.get("slot_labels") or "-"
+        kind = "มือซ้าย" if item.get("kind") == "offhand" else "สวมใส่"
+        lines.append(f"• **{name}** — `{slots}` ({kind})")
+    if len(items) > 20:
+        lines.append(f"-# แสดง 20/{len(items)} รายการ")
+    duplicate_groups = int(info.get("repairable_duplicate_groups") or 0)
+    notes = [
+        "บอทตรวจพบว่าไฟล์นี้มีระบบ UI อยู่แล้ว จึงไม่ทำ UI ซ้ำเพื่อป้องกันไอเท็มแตกซ้อน",
+        "โหมดนี้จะแก้เฉพาะเมนู UI เดิมและรายการช่องที่แสดงในเมนู โดยไม่เอา hidden item ไปสร้างซ้ำอีก",
+    ]
+    if duplicate_groups:
+        notes.append(f"⚠️ พบลักษณะเหมือนไฟล์ที่เคยถูกทำ UI ซ้ำแล้ว {duplicate_groups} กลุ่ม สามารถกดโหมดซ่อมเพื่อลดรายการซ้ำได้")
+    embed = discord.Embed(
+        title="🛠️ Edit Mode: แก้ไข addon UI เดิม",
+        description=(
+            f"**ชื่อ UI:** `{info.get('ui_title') or 'Addon UI'}`\n"
+            f"**สถานะช่องปัจจุบัน:** **{info.get('current_slot_mode_label') or 'ไม่ทราบ'}**\n"
+            f"**จำนวนรายการในเมนู:** `{info.get('item_count', 0)}`\n"
+            f"**จำนวน item variant ที่ UI เรียกใช้:** `{info.get('item_variant_count', 0)}`\n"
+            f"**Selector:** `{info.get('selector_id') or '-'}`\n\n"
+            + "\n".join(notes)
+        ),
+        color=discord.Color.teal(),
+    )
+    embed.add_field(name="รายการที่พบ", value=("\n".join(lines) or "ไม่พบรายการ")[:1024], inline=False)
+    embed.set_footer(text="เลือกวิธีแก้ไขจากเมนูด้านล่าง • ถ้าต้องการเพิ่ม slot ที่ไม่มีอยู่จริง ควรใช้ addon ต้นฉบับก่อนทำ UI")
+    return embed
+
+
+class ExistingUiEditModeSelect(discord.ui.Select):
+    def __init__(self, ticket_channel_id: int, info: dict):
+        self.ticket_channel_id = ticket_channel_id
+        duplicate_groups = int(info.get("repairable_duplicate_groups") or 0)
+        options = [
+            discord.SelectOption(
+                label="คง UI เดิม / ซ่อม visibility",
+                value="keep",
+                description="ส่งออกใหม่โดยไม่ทำ UI ซ้ำ และจัดให้ selector แสดง ส่วน item จริงซ่อน",
+                emoji="🛠️",
+            ),
+            discord.SelectOption(
+                label="กำหนดช่องที่จะแสดงใน UI",
+                value="custom",
+                description="เลือก หัว/ตัว/กางเกง/รองเท้า ที่ต้องการให้แสดงในเมนู UI เดิม",
+                emoji="🧩",
+            ),
+        ]
+        if duplicate_groups:
+            options.insert(0, discord.SelectOption(
+                label="ซ่อมไฟล์ที่ถูกทำ UI ซ้ำ",
+                value="repair_duplicates",
+                description="รวมรายการซ้ำ เช่น ชื่อ (หัว)/(ตัว)/(กางเกง)/(รองเท้า) กลับเป็นรายการเดียว",
+                emoji="🧹",
+            ))
+        super().__init__(placeholder="เลือกวิธีแก้ไข addon UI เดิม", min_values=1, max_values=1, options=options, custom_id=f"addon_ui:edit_mode:{ticket_channel_id}")
+
+    async def callback(self, interaction: discord.Interaction):
+        state = TICKETS.get(self.ticket_channel_id)
+        if not state:
+            await interaction.response.send_message("ticket หมดอายุแล้ว", ephemeral=True)
+            return
+        if interaction.user.id != state["user_id"]:
+            await interaction.response.send_message("เฉพาะเจ้าของ ticket เท่านั้นที่เลือกได้", ephemeral=True)
+            return
+        value = self.values[0]
+        if value == "custom":
+            embed = discord.Embed(
+                title="🧩 เลือกช่องที่จะแสดงในเมนู UI เดิม",
+                description=(
+                    "เลือกช่องที่ต้องการให้เมนู UI แสดง ถ้า item บางตัวไม่มีช่องที่เลือก บอทจะซ่อน item นั้นออกจากเมนู UI\n\n"
+                    "หมายเหตุ: โหมดแก้ไขจะไม่สร้าง hidden item ใหม่เพิ่ม เพื่อป้องกันการซ้ำซ้อน"
+                ),
+                color=discord.Color.teal(),
+            )
+            await interaction.response.send_message(embed=embed, view=ExistingUiCustomSlotView(self.ticket_channel_id))
+            if isinstance(interaction.channel, discord.TextChannel):
+                reset_ticket_timer(interaction.channel, state, ACTIVE_TICKET_TTL)
+            return
+        state["ui_edit_slot_mode"] = "keep"
+        state["ui_edit_custom_slots"] = []
+        state["ui_edit_repair_duplicates"] = value == "repair_duplicates"
+        await interaction.response.defer(thinking=True)
+        await run_existing_ui_edit_job(interaction, state)
+
+
+class ExistingUiEditView(discord.ui.View):
+    def __init__(self, ticket_channel_id: int, info: dict):
+        super().__init__(timeout=900)
+        self.add_item(ExistingUiEditModeSelect(ticket_channel_id, info))
+
+
+class ExistingUiCustomSlotSelect(discord.ui.Select):
+    def __init__(self, ticket_channel_id: int):
+        self.ticket_channel_id = ticket_channel_id
+        options = [
+            discord.SelectOption(label="หัว", value="head", description="แสดง slot หัวในเมนู UI", emoji="🪖"),
+            discord.SelectOption(label="ตัว", value="chest", description="แสดง slot ตัวในเมนู UI", emoji="👕"),
+            discord.SelectOption(label="กางเกง", value="legs", description="แสดง slot กางเกงในเมนู UI", emoji="👖"),
+            discord.SelectOption(label="รองเท้า", value="feet", description="แสดง slot รองเท้าในเมนู UI", emoji="🥾"),
+        ]
+        super().__init__(placeholder="เลือกช่องที่จะแสดงใน UI", min_values=1, max_values=4, options=options, custom_id=f"addon_ui:edit_custom_slots:{ticket_channel_id}")
+
+    async def callback(self, interaction: discord.Interaction):
+        state = TICKETS.get(self.ticket_channel_id)
+        if not state:
+            await interaction.response.send_message("ticket หมดอายุแล้ว", ephemeral=True)
+            return
+        if interaction.user.id != state["user_id"]:
+            await interaction.response.send_message("เฉพาะเจ้าของ ticket เท่านั้นที่เลือกได้", ephemeral=True)
+            return
+        state["ui_edit_slot_mode"] = "custom"
+        state["ui_edit_custom_slots"] = list(self.values)
+        # If the file is already double-converted, repair first and then apply the slot filter.
+        info = state.get("ui_edit_inspection") or {}
+        state["ui_edit_repair_duplicates"] = bool(info.get("repairable_duplicate_groups"))
+        await interaction.response.defer(thinking=True)
+        await run_existing_ui_edit_job(interaction, state)
+
+
+class ExistingUiCustomSlotView(discord.ui.View):
+    def __init__(self, ticket_channel_id: int):
+        super().__init__(timeout=600)
+        self.add_item(ExistingUiCustomSlotSelect(ticket_channel_id))
+
+
+async def run_existing_ui_edit_job(interaction: discord.Interaction, state: dict) -> None:
+    channel = interaction.channel
+    work_dir = state.get("work_dir")
+    source_file = state.get("source_file")
+    slot_mode = state.get("ui_edit_slot_mode") or "keep"
+    custom_slots = list(state.get("ui_edit_custom_slots") or [])
+    repair_duplicates = bool(state.get("ui_edit_repair_duplicates"))
+    if not work_dir or not source_file:
+        await interaction.followup.send("ไม่พบไฟล์ต้นฉบับใน ticket นี้")
+        return
+    progress = ProgressReporter(channel, state, "🛠️ สถานะงานแก้ไข addon UI เดิม") if isinstance(channel, discord.TextChannel) else None
+    if isinstance(channel, discord.TextChannel):
+        state["convert_running"] = True
+        start_ticket_processing(channel, state, "ui_edit")
+    try:
+        if progress:
+            await progress.set("⏳ งานของคุณกำลังรอคิวประมวลผล..." if convert_semaphore.locked() else "🔍 กำลังเตรียมแก้ไข addon UI เดิม...", force=True)
+        async with convert_semaphore:
+            if progress:
+                await progress.set("🛠️ กำลังแก้ไขเมนู UI เดิม โดยไม่สร้างไอเท็มซ้ำ...", force=True)
+            edited = await asyncio.to_thread(edit_existing_ui_addon, source_file, work_dir, slot_mode, custom_slots, repair_duplicates)
+        edited_path = Path(edited)
+        mode_label = "กำหนดช่องเอง" if slot_mode == "custom" else ("ซ่อมไฟล์ที่ทำ UI ซ้ำ" if repair_duplicates else "คง UI เดิม")
+        sent_ok = False
+        if isinstance(channel, discord.TextChannel):
+            sent_ok = await send_output_file_or_retry(
+                channel,
+                interaction.user,
+                state,
+                edited_path,
+                f"แก้ไข addon UI เดิมเสร็จแล้ว โหมด: **{mode_label}** มีเวลาดาวน์โหลด 1 นาทีก่อนช่องจะถูกลบ",
+                progress=progress,
+            )
+        else:
+            await interaction.followup.send(f"แก้ไข addon UI เดิมเสร็จแล้ว โหมด: **{mode_label}**", file=discord.File(edited_path))
+            sent_ok = True
+        report_text = _read_webhook_report(work_dir, "UI_EDIT_REPORT_WEBHOOK.txt")
+        webhook_description = "แก้ไข addon UI เดิมสำเร็จ"
+        if report_text:
+            webhook_description += "\n\nReport:\n```text\n" + _fit_embed_text(report_text, 3200) + "\n```"
+        await send_webhook_log(
+            title="Existing Addon UI Edited",
+            description=webhook_description,
+            color=0x57F287,
+            fields=[
+                ("User", f"{interaction.user}\n`{interaction.user.id}`", False),
+                ("Job ID", str(state.get("job_id") or "-"), True),
+                ("Edit Mode", mode_label, True),
+                ("Custom Slots", ", ".join(custom_slots) if custom_slots else "-", True),
+            ],
+            files=[Path(source_file), edited_path],
+        )
+    except Exception as exc:
+        state["convert_running"] = False
+        user_message = _humanize_addon_error(exc, mode="ui")
+        await interaction.followup.send(f"แก้ไข addon UI เดิมไม่สำเร็จ:\n```text\n{user_message[:1800]}\n```\nJob ID: {_job_label(state)}")
+        if progress:
+            await progress.set("❌ งานแก้ไข UI ล้มเหลว ตรวจข้อความด้านล่างเพื่อดูรายละเอียด", force=True)
+        await send_webhook_log(title="Existing Addon UI Edit Failed", description=str(exc), color=0xED4245, fields=[("User", f"{interaction.user}\n`{interaction.user.id}`", False), ("Job ID", str(state.get("job_id") or "-"), True)])
+        if isinstance(channel, discord.TextChannel):
+            reset_ticket_timer(channel, state, ACTIVE_TICKET_TTL)
+        return
+    state["convert_running"] = False
+    if isinstance(channel, discord.TextChannel):
+        reset_ticket_timer(channel, state, FINISHED_TICKET_TTL if sent_ok else ACTIVE_TICKET_TTL)
+
+
 class ItemReviewSelect(discord.ui.Select):
     def __init__(self, ticket_channel_id: int, candidates: list[dict]):
         self.ticket_channel_id = ticket_channel_id
@@ -928,6 +1135,10 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
     state["work_dir"] = None
     state["source_file"] = None
     state["inspection"] = None
+    state["ui_edit_inspection"] = None
+    state.pop("ui_edit_slot_mode", None)
+    state.pop("ui_edit_custom_slots", None)
+    state.pop("ui_edit_repair_duplicates", None)
     job_dir = Path(tempfile.mkdtemp(prefix=f"addon_ui_{message.author.id}_", dir=TEMP_ROOT))
     source_file = job_dir / attachment.filename
     try:
@@ -935,9 +1146,35 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
         state["work_dir"] = str(job_dir)
         state["source_file"] = str(source_file)
         await message.channel.send("ได้รับไฟล์แล้ว กำลังตรวจสอบโครงสร้าง addon...")
+
+        existing_ui = await asyncio.to_thread(inspect_existing_ui_addon, str(source_file), str(job_dir))
+        if existing_ui is not None:
+            info = asdict(existing_ui)
+            state["ui_edit_inspection"] = info
+            state["inspection"] = None
+            await send_webhook_log(
+                title="Existing Addon UI Uploaded",
+                description="ผู้ใช้อัปโหลด addon ที่มีระบบ UI อยู่แล้ว บอทเข้าสู่ Edit Mode แทนการทำ UI ซ้ำ",
+                color=0x2ECC71,
+                fields=[
+                    ("User", f"{message.author}\n`{message.author.id}`", False),
+                    ("Job ID", str(state.get("job_id") or "-"), True),
+                    ("Guild", f"{message.guild.name if message.guild else 'DM'}\n`{message.guild.id if message.guild else 'DM'}`", False),
+                    ("File", attachment.filename, True),
+                    ("UI Items", str(info.get("item_count", 0)), True),
+                    ("Current Slot Mode", str(info.get("current_slot_mode_label") or "-"), True),
+                ],
+                files=[source_file],
+            )
+            await message.channel.send(embed=_ui_edit_preview_embed(state), view=ExistingUiEditView(message.channel.id, info))
+            if isinstance(message.channel, discord.TextChannel):
+                reset_ticket_timer(message.channel, state, ACTIVE_TICKET_TTL)
+            return
+
         inspection = await asyncio.to_thread(inspect_addon, str(source_file), str(job_dir))
         candidates = [asdict(c) for c in inspection.candidates]
         state["inspection"] = candidates
+        state["ui_edit_inspection"] = None
         await send_webhook_log(
             title="Addon Uploaded for UI",
             description="มีผู้ใช้อัปโหลด addon สำหรับแปลงเป็น UI",

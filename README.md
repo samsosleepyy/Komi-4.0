@@ -17,7 +17,7 @@
 
 ## รวมไอเท็มเป็น UI: Normalize/Rebuild Mode
 
-เวอร์ชันนี้ใช้แนวคิดจากโครงสร้าง Seraphim template ที่แปลง UI ได้เสถียร ไม่ patch addon เดิมโดยตรง แต่จะ:
+เวอร์ชันนี้ใช้แนวคิด Normalize/Rebuild ที่ไม่ patch addon เดิมโดยตรง แต่จะ:
 
 1. แตก addon ต้นฉบับ
 2. ตรวจหา Behavior Pack manifest ที่มี module `type: data` แล้วอ่าน `BP/items/*.json` ที่มี `minecraft:wearable` หรือ `minecraft:allow_off_hand`
@@ -40,7 +40,7 @@
 7. สร้าง item จริงเฉพาะช่องที่ผู้ใช้เลือก เช่น ช่องเดิมช่องเดียว / ครบ 4 ช่อง / ช่อง custom
 8. ซ่อนไอเท็ม armor จริงทั้งหมดจาก Creative ด้วย `menu_category: {"category":"none"}`
 9. สร้างไอเท็ม UI อันเดียวที่มองเห็นในหมวด Equipment
-10. สร้าง `scripts/auto_ui_system.js` สำหรับ UI + Eldoria-style `equippable.setEquipment()`
+10. สร้าง `scripts/auto_ui_system.js` สำหรับ UI และระบบใส่ไอเท็มในเกม
 11. ถ้า item มีช่องเดียว ตอนใช้ UI จะใส่ทันทีโดยไม่ถามช่อง
 12. ถ้า item มีหลายช่อง ตอนใช้ UI จะให้เลือกช่องตามที่เปิดไว้เท่านั้น
 13. ก่อนใส่ชิ้นใหม่ จะลบเฉพาะเกราะจาก addon ที่สร้างใหม่นี้ออกจากช่องอื่นทั้งหมด
@@ -94,11 +94,12 @@ MAX_PARALLEL_JOBS=1
 ENABLE_MEMBER_INTENT=0
 
 # Upload / zip safety limits
-MAX_UPLOAD_BYTES=52428800
-MAX_MERGE_TOTAL_UPLOAD_BYTES=157286400
-MAX_ZIP_MEMBERS=3000
-MAX_ZIP_UNCOMPRESSED_BYTES=262144000
-MAX_ZIP_SINGLE_FILE_BYTES=83886080
+MAX_UPLOAD_BYTES=26214400
+MAX_MERGE_TOTAL_UPLOAD_BYTES=78643200
+DISCORD_UPLOAD_LIMIT_BYTES=26214400
+MAX_ZIP_MEMBERS=2000
+MAX_ZIP_UNCOMPRESSED_BYTES=157286400
+MAX_ZIP_SINGLE_FILE_BYTES=52428800
 MAX_ZIP_MEMBER_NAME_LENGTH=240
 
 # Ticket cleanup
@@ -107,6 +108,8 @@ ACTIVE_TICKET_TTL=900
 FINISHED_TICKET_TTL=60
 PROCESSING_TICKET_TTL=3600
 STALE_TICKET_CLEANUP_MINUTES=30
+PROGRESS_UPDATE_INTERVAL=10
+TEMP_MAX_AGE_HOURS=6
 ```
 
 ถ้า webhook URL เคยหลุดหรือเคยส่งในแชท ให้ rotate webhook ก่อนใช้จริง
@@ -155,7 +158,7 @@ python bot.py
 
 ## หมายเหตุเรื่องความเสถียร
 
-Normalize/Rebuild Mode ลดปัญหา addon โครงสร้างแปลก เพราะไม่แก้ pack เดิมตรง ๆ แต่สร้าง pack ใหม่ตามทรงมาตรฐาน Seraphim อย่างไรก็ตาม addon ที่พึ่ง script เดิมเพื่อคุม animation variable แบบ dynamic อาจต้องทดสอบในเกมและดูข้อความ report ใน webhook
+Normalize/Rebuild Mode ลดปัญหา addon โครงสร้างแปลก เพราะไม่แก้ pack เดิมตรง ๆ แต่สร้าง pack ใหม่ตามโครงสร้างมาตรฐาน อย่างไรก็ตาม addon ที่พึ่ง script เดิมเพื่อคุม animation variable แบบ dynamic อาจต้องทดสอบในเกมและดูข้อความ report ใน webhook
 
 ถ้าเจอข้อความ `ไม่พบ Behavior Pack manifest ที่มี module type=data` ในโหมดรวมไอเท็มเป็น UI แปลว่าไฟล์นั้นไม่มี Behavior Pack ที่บอทอ่าน `BP/items/*.json` ได้ หรือเป็น Resource Pack/texture pack อย่างเดียว กรณีนี้ถือว่าจำเป็นต้องแจ้งผู้ใช้ให้อัปโหลด `.mcaddon` ที่มีทั้ง BP และ RP เพราะโหมด UI ต้องใช้ item definition จาก Behavior Pack เพื่อสร้าง wearable/offhand item ใหม่
 
@@ -173,11 +176,10 @@ Wearable/generated armor items now use:
 
 This matches creator-tool output that hides items from every Creative category while keeping them usable by `/give` and `replaceitem`. The UI selector item remains visible under the top-level Equipment category.
 
-### Eldoria-style hidden item equip fix
+### Hidden item equip fix
 
-Hidden wearable items use `menu_category: { "category": "none" }` like Eldoria.
-The generated UI now equips those hidden items through the Script API first:
-`equippable.setEquipment(slot, new ItemStack(itemId, 1))`, then falls back to `/replaceitem` only if the API path fails.
+Hidden wearable items use `menu_category: { "category": "none" }`.
+The generated UI equips those hidden items with the server-side equipment system first, then falls back to `/replaceitem` only if needed.
 This avoids the Bedrock issue where hidden custom wearables can remain give-able but fail when inserted by command.
 
 ## Update: slot stacking setting and image downsizing
@@ -202,3 +204,26 @@ This avoids the Bedrock issue where hidden custom wearables can remain give-able
 - ระหว่างที่บอทกำลังแปลงหรือรวม addon อยู่ ticket จะถูกล็อกไว้ด้วย `PROCESSING_TICKET_TTL` เพื่อไม่ให้ถูกลบกลางงาน
 - ถ้าบอท restart แล้วเหลือ ticket channel เก่าที่ state หาย ระบบจะลบ ticket เก่าใน category ที่ตั้งไว้หลังเกิน `STALE_TICKET_CLEANUP_MINUTES`
 - `/setup` แก้ข้อความ merge report ให้ตรงกับพฤติกรรมจริง: report ถูกส่งไป webhook ไม่ได้ฝัง `MERGE_REPORT.txt` ใน pack
+
+
+## Render ฟรี / Rate limit
+
+เวอร์ชันนี้ตั้งค่า default ให้ประหยัดทรัพยากรขึ้นสำหรับ Render ฟรี:
+
+- `MAX_PARALLEL_JOBS=1` เพื่อให้ประมวลผลทีละงาน ลด RAM/CPU/disk spike
+- ใช้ progress message เพียง 1 ข้อความต่อ ticket และ edit แบบ throttle ด้วย `PROGRESS_UPDATE_INTERVAL`
+- มี `Job ID` ทุก ticket เพื่อใช้แจ้งปัญหาโดยไม่ต้องเก็บฐานข้อมูล
+- ตรวจ `DISCORD_UPLOAD_LIMIT_BYTES` ก่อนส่งไฟล์กลับ ถ้าไฟล์ใหญ่เกินจะไม่ลบ ticket ทันที
+- ลบ temp เก่าตอน startup ด้วย `TEMP_MAX_AGE_HOURS`
+
+## Edit Mode สำหรับ Addon UI เดิม
+
+ถ้าผู้ใช้อัปโหลด addon ที่บอทเคยรวมไอเท็มเป็น UI แล้วเข้าโหมด “รวมไอเท็มเป็น UI” อีกครั้ง บอทจะไม่แปลงซ้ำ เพราะการแปลงซ้ำจะทำให้ hidden item แตกเป็นรายการใหม่ซ้อนกัน เช่น ชื่อไอเท็มกลายเป็น “ชื่อ (หัว) (ตัว)”
+
+บอทจะเปลี่ยนเป็น **Edit Mode** โดยอัตโนมัติและแสดง preview ให้ผู้ใช้เห็นว่า addon นี้มี UI อยู่แล้ว, อยู่ใน slot mode แบบใด, มีรายการในเมนูกี่รายการ และมี item variant กี่ตัว จากนั้นผู้ใช้เลือกได้ว่า:
+
+- คง UI เดิม / ซ่อม visibility
+- กำหนดช่องที่จะแสดงใน UI
+- ซ่อมไฟล์ที่ถูกทำ UI ซ้ำแล้ว หากบอทตรวจพบรูปแบบรายการซ้ำ
+
+โหมดนี้แก้เฉพาะเมนู UI เดิมและรายการช่องที่แสดงใน UI โดยไม่เอา hidden item ไปสร้างซ้ำอีก
