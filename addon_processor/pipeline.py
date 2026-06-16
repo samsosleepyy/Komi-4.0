@@ -15,12 +15,14 @@ try:
 except Exception:  # Pillow is optional at import time; resize helpers no-op if unavailable.
     Image = None
 
-SLOTS = [
+ARMOR_SLOTS = [
     ("head", "หัว", "slot.armor.head", "Head", "helmet"),
     ("chest", "ตัว", "slot.armor.chest", "Chest", "chest"),
     ("legs", "กางเกง", "slot.armor.legs", "Legs", "leg"),
     ("feet", "รองเท้า", "slot.armor.feet", "Feet", "boot"),
 ]
+OFFHAND_SLOT = ("offhand", "มือซ้าย", "slot.weapon.offhand", "Offhand", "offhand")
+SLOTS = ARMOR_SLOTS + [OFFHAND_SLOT]
 
 SLOT_BY_WEARABLE = {
     "slot.armor.head": "head",
@@ -28,8 +30,10 @@ SLOT_BY_WEARABLE = {
     "slot.armor.body": "chest",
     "slot.armor.legs": "legs",
     "slot.armor.feet": "feet",
+    "slot.weapon.offhand": "offhand",
 }
 
+ARMOR_SLOT_KEYS = [slot[0] for slot in ARMOR_SLOTS]
 SLOT_KEYS = [slot[0] for slot in SLOTS]
 SLOTS_BY_KEY = {slot[0]: slot for slot in SLOTS}
 
@@ -38,8 +42,8 @@ def _slot_keys_for_candidate(candidate: "AddonItemCandidate", slot_mode: str = "
     """Return the output wearable slots for one selected source item.
 
     original: keep only the source item's original wearable slot.
-    all: create all four wearable variants.
-    custom: create only the user-selected slots.
+    all: create all four armor variants. Offhand is kept for original/custom only.
+    custom: create only the user-selected slots, including offhand when selected.
     """
     mode = (slot_mode or "all").lower()
     if mode == "original":
@@ -49,7 +53,7 @@ def _slot_keys_for_candidate(candidate: "AddonItemCandidate", slot_mode: str = "
         if not slots:
             raise AddonError("ยังไม่ได้เลือกช่องที่จะให้ไอเท็มใส่ได้")
         return list(dict.fromkeys(slots))
-    return list(SLOT_KEYS)
+    return list(ARMOR_SLOT_KEYS)
 
 
 TEXTURE_EXTS = (".png", ".tga", ".jpg", ".jpeg", ".webp")
@@ -745,6 +749,136 @@ def _label_for_existing_ui_item(base_name: str, slot_key: str, kind: str = "wear
     return f"{base_name} ({_slot_label_for_existing_ui(slot_key)})"
 
 
+
+def _append_added_items_to_existing_ui(
+    *,
+    dst_bp: Path,
+    dst_rp: Path,
+    work_dir: Path,
+    armors: List[Dict[str, Any]],
+    additions: Optional[List[Dict[str, Any]]],
+    warnings: List[str],
+) -> int:
+    """Append newly uploaded normal-addon items into an existing generated UI addon.
+
+    Each addition is expected to contain:
+      addon_path, selected_identifiers, slot_mode, custom_slots
+
+    This reuses the same normalize/rebuild logic as first-time UI conversion, but
+    writes the generated hidden items/assets into the already extracted UI addon.
+    """
+    if not additions:
+        return 0
+
+    atlas_path, atlas = _load_item_texture_data(dst_rp)
+    texture_data = atlas.setdefault("texture_data", {})
+    if not isinstance(texture_data, dict):
+        texture_data = {}
+        atlas["texture_data"] = texture_data
+
+    added_entries = 0
+    existing_count = len(armors)
+    for add_index, addition in enumerate(additions, start=1):
+        addon_path = Path(str(addition.get("addon_path") or ""))
+        if not addon_path.exists():
+            warnings.append(f"ข้าม addon เพิ่มไอเท็ม #{add_index}: ไม่พบไฟล์ต้นทาง")
+            continue
+        selected_ids = [str(x) for x in (addition.get("selected_identifiers") or []) if str(x)]
+        if not selected_ids:
+            warnings.append(f"ข้าม addon เพิ่มไอเท็ม #{add_index}: ยังไม่ได้เลือกไอเท็ม")
+            continue
+        add_root = work_dir / f"ui_add_src_{add_index:02d}"
+        if add_root.exists():
+            shutil.rmtree(add_root)
+        _extract_addon_zip(addon_path, add_root)
+        src_bp, src_rp = _find_packs(add_root)
+        candidates = _scan_candidates(add_root, src_bp)
+        selected = [c for c in candidates if c.identifier in set(selected_ids)]
+        if not selected:
+            warnings.append(f"ข้าม addon เพิ่มไอเท็ม #{add_index}: ไม่พบไอเท็มที่เลือกไว้ในไฟล์")
+            continue
+
+        addon_name = _addon_base_name(src_bp, src_rp)
+        safe_addon = _safe_id(addon_name, f"addon_{add_index}")
+        add_token = _safe_id(str(addition.get("token") or uuid4().hex[:6]), "add")
+        slot_mode = str(addition.get("slot_mode") or "original").lower()
+        custom_slots = [s for s in (addition.get("custom_slots") or []) if s in SLOT_KEYS]
+
+        for local_idx, candidate in enumerate(selected, start=1):
+            global_idx = existing_count + added_entries + 1
+            orig_ns, orig_name = _identifier_parts(candidate.identifier)
+            item_kind = getattr(candidate, "item_kind", "wearable")
+            base_prefix = "offhand" if item_kind == "offhand" else "armor"
+            base = f"add_{add_index:02d}_{global_idx:03d}_{base_prefix}_{safe_addon}_{add_token}_{orig_ns}_{orig_name}"
+            new_ns = _safe_id(f"{safe_addon}_uiadd_{add_token}_{global_idx:03d}", "uiadd")
+            item_path = add_root / candidate.file_path
+            try:
+                item_data = _read_json(item_path)
+            except Exception:
+                item_data = {}
+            src_attach = _find_attachable_for_item(src_rp, candidate.identifier, candidate.file_path)
+            if not src_attach and item_kind != "offhand":
+                warnings.append(f"ไม่พบ attachable สำหรับไอเท็มที่เพิ่ม {candidate.identifier}; จะสร้าง attachable พื้นฐาน")
+
+            fallback_texture = ""
+            if src_attach:
+                try:
+                    desc = _extract_attachable_desc(src_attach)
+                    texs = desc.get("textures", {})
+                    if isinstance(texs, dict):
+                        fallback_texture = next((v for v in texs.values() if isinstance(v, str) and v.startswith("textures/") and "enchanted" not in v), "")
+                except Exception:
+                    pass
+            generated_icon_key = f"{base}_icon"
+            icon_ref = _copy_icon(src_rp, dst_rp, candidate.icon or generated_icon_key, generated_icon_key, fallback_texture, warnings)
+            texture_data[generated_icon_key] = {"textures": icon_ref}
+
+            armor_entry: Dict[str, Any] = {
+                "name": candidate.display_name,
+                "icon": icon_ref,
+                "items": {},
+                "kind": item_kind,
+            }
+
+            if item_kind == "offhand":
+                new_item_name = f"{base}_offhand"
+                new_item_id = f"{new_ns}:{new_item_name}"
+                armor_entry["items"]["offhand"] = new_item_id
+                label = f"{candidate.display_name} (มือซ้าย)"
+                item_json = _make_generated_offhand_item(item_data, new_item_id, generated_icon_key, label)
+                _write_json(dst_bp / "items" / f"{new_item_name}.json", item_json)
+                _normalize_attachable_for_item(src_rp, dst_rp, src_attach, new_item_id, base, warnings)
+                armors.append(armor_entry)
+                added_entries += 1
+                continue
+
+            output_slot_keys = _slot_keys_for_candidate(candidate, slot_mode, custom_slots)
+            if slot_mode == "original" and candidate.wearable_slot not in SLOT_BY_WEARABLE:
+                warnings.append(f"ไม่รู้จัก wearable slot เดิมของไอเท็มที่เพิ่ม {candidate.identifier}: {candidate.wearable_slot}; fallback เป็นกางเกง")
+            if output_slot_keys == ["offhand"]:
+                armor_entry["kind"] = "offhand"
+            for slot_key in output_slot_keys:
+                wearable_slot = SLOTS_BY_KEY[slot_key][2]
+                new_item_name = f"{base}_{slot_key}"
+                new_item_id = f"{new_ns}:{new_item_name}"
+                armor_entry["items"][slot_key] = new_item_id
+                if slot_key == "offhand":
+                    label = f"{candidate.display_name} (มือซ้าย)"
+                    item_json = _make_generated_offhand_item(item_data, new_item_id, generated_icon_key, label)
+                    _write_json(dst_bp / "items" / f"{new_item_name}.json", item_json)
+                    _normalize_attachable_for_item(src_rp, dst_rp, src_attach, new_item_id, base, warnings)
+                else:
+                    label = _lang_label(candidate.display_name, slot_key)
+                    item_json = _make_generated_item(new_item_id, generated_icon_key, label, wearable_slot)
+                    _write_json(dst_bp / "items" / f"{new_item_name}.json", item_json)
+                    _normalize_attachable_for_slot(src_rp, dst_rp, src_attach, new_item_id, base, slot_key, warnings)
+            armors.append(armor_entry)
+            added_entries += 1
+
+    _write_json(atlas_path, atlas)
+    _resize_item_icon_tree(dst_rp)
+    return added_entries
+
 def edit_existing_ui_addon(
     addon_path: str,
     work_dir: str,
@@ -755,6 +889,7 @@ def edit_existing_ui_addon(
     pack_name: Optional[str] = None,
     pack_icon_path: Optional[str] = None,
     item_renames: Optional[Dict[str, str]] = None,
+    additions: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Edit a previously generated UI addon without converting hidden items again.
 
@@ -780,6 +915,17 @@ def edit_existing_ui_addon(
         armors, repaired = _collapse_duplicate_ui_armors(armors)
         if repaired:
             warnings.append(f"ซ่อมรายการที่น่าจะเกิดจากการทำ UI ซ้ำ {repaired} กลุ่ม")
+
+    added_entries = _append_added_items_to_existing_ui(
+        dst_bp=bp,
+        dst_rp=rp,
+        work_dir=Path(work_dir),
+        armors=armors,
+        additions=additions,
+        warnings=warnings,
+    )
+    if added_entries:
+        warnings.append(f"เพิ่มไอเท็มใหม่เข้า UI {added_entries} รายการ")
 
     mode = (slot_mode or "keep").lower()
     allowed = [s for s in (custom_slots or []) if s in SLOT_KEYS]
@@ -860,6 +1006,7 @@ def edit_existing_ui_addon(
         f"Custom slots: {', '.join(allowed) if allowed else '-'}",
         f"Renamed menu entries: {len(renames)}",
         f"Pack icon changed: {'yes' if pack_icon_path else 'no'}",
+        f"Added menu entries: {added_entries}",
         f"Menu entries: {len(new_armors)}",
         f"Visible item variants in UI: {len(cfg['allItems'])}",
     ]
@@ -1780,6 +1927,8 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
             continue
 
         output_slot_keys = _slot_keys_for_candidate(candidate, slot_mode, custom_slots)
+        if output_slot_keys == ["offhand"]:
+            armor_entry["kind"] = "offhand"
         if slot_mode == "original" and candidate.wearable_slot not in SLOT_BY_WEARABLE:
             warnings.append(f"ไม่รู้จัก wearable slot เดิมของ {candidate.identifier}: {candidate.wearable_slot}; fallback เป็นกางเกง")
         for slot_key in output_slot_keys:
@@ -1788,10 +1937,16 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
             new_item_id = f"{new_ns}:{new_item_name}"
             all_item_ids.append(new_item_id)
             armor_entry["items"][slot_key] = new_item_id
-            label = _lang_label(candidate.display_name, slot_key)
-            item_json = _make_generated_item(new_item_id, generated_icon_key, label, wearable_slot)
-            _write_json(dst_bp / "items" / f"{new_item_name}.json", item_json)
-            _normalize_attachable_for_slot(src_rp, dst_rp, src_attach, new_item_id, base, slot_key, warnings)
+            if slot_key == "offhand":
+                label = f"{candidate.display_name} (มือซ้าย)"
+                item_json = _make_generated_offhand_item(item_data, new_item_id, generated_icon_key, label)
+                _write_json(dst_bp / "items" / f"{new_item_name}.json", item_json)
+                _normalize_attachable_for_item(src_rp, dst_rp, src_attach, new_item_id, base, warnings)
+            else:
+                label = _lang_label(candidate.display_name, slot_key)
+                item_json = _make_generated_item(new_item_id, generated_icon_key, label, wearable_slot)
+                _write_json(dst_bp / "items" / f"{new_item_name}.json", item_json)
+                _normalize_attachable_for_slot(src_rp, dst_rp, src_attach, new_item_id, base, slot_key, warnings)
             lang_lines.append(f"item.{new_item_id}.name={label}")
             lang_lines.append(f"item.{new_item_name}.name={label}")
         armors.append(armor_entry)
