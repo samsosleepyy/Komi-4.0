@@ -211,6 +211,11 @@ def _extract_warning_lines(report_text: str) -> list[str]:
         lower = item.lower()
         if "no major warnings" in lower or "ไม่พบ warning" in lower:
             continue
+        # Informational merge note, not a user-facing warning/danger.
+        if ("ตรวจพบ addon" in item and "เคยรวมไอเท็มเป็น ui" in lower and "คงการซ่อน" in item):
+            continue
+        if ("already has a ui selector system" in lower and "kept hidden as expected" in lower):
+            continue
         warnings.append(item)
     # Keep order but remove duplicates so the Discord embed stays short.
     return list(dict.fromkeys(warnings))
@@ -269,9 +274,9 @@ def _warning_details(warning: str) -> tuple[str, str, str]:
         )
     if "ซ่อน" in w:
         return (
-            "ช่องที่เลือกใน Edit Mode ไม่ตรงกับ variant บางตัวที่มีอยู่ใน UI เดิม",
-            "รายการนั้นจะไม่แสดงในเมนู UI แต่ไฟล์ item อาจยังอยู่ในแพคและถูกซ่อนไว้",
-            "กลับไปเลือกช่องเพิ่ม หรือใช้โหมดใส่ได้ทุกช่องถ้าต้องการให้แสดงครบ",
+            "มีรายการบางตัวถูกซ่อนไว้ตามการตั้งค่าของระบบ UI หรือการตั้งค่าช่องที่เลือก",
+            "ถ้าเป็น addon UI เดิม นี่เป็นพฤติกรรมปกติ: ไอเท็มจริงจะถูกซ่อนเพื่อให้ผู้ใช้เห็นเฉพาะไอเท็ม UI selector ใน Creative",
+            "ไม่ต้องแก้ ถ้า selector ยังอยู่และเปิดเมนูได้ตามปกติ; แก้เฉพาะกรณีที่ต้องการให้รายการใดกลับมาแสดงในเมนู UI",
         )
     if "ui ซ้ำ" in w or "ทำ ui ซ้ำ" in w:
         return (

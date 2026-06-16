@@ -258,3 +258,10 @@ This avoids the Bedrock issue where hidden custom wearables can remain give-able
 - ถ้าอัปโหลด addon UI เก่าเข้า Edit Mode แล้วกดส่งออกใหม่ บอทจะอัปเกรด icon key/path ของ selector ให้ unique อัตโนมัติ
 - หลังประมวลผลสำเร็จ หาก report มี `Warnings:` บอทจะส่ง embed แจ้งผู้ใช้ใน ticket เฉพาะ warning เท่านั้น พร้อมสาเหตุ ผลที่จะเกิดถ้านำไปใช้ และวิธีแก้เบื้องต้น
 - Webhook ยังได้รับ report เต็มเหมือนเดิม ส่วนผู้ใช้จะเห็นเฉพาะ warning ที่จำเป็น ไม่เห็นรายละเอียด debug ทั้งหมด
+
+
+### Update: ข้อความ UI addon ใน Merge Mode เป็นข้อมูลสถานะ ไม่ใช่ Warning
+
+- หากโหมดรวมแอดออนตรวจพบว่าไฟล์ต้นทางเคยถูกแปลงเป็น UI selector แล้ว ระบบจะรักษาการซ่อนไอเท็มจริงไว้ตามเดิม เพื่อให้เห็นเฉพาะไอเท็ม UI ใน Creative
+- ข้อความลักษณะนี้ไม่ถูกนับเป็นคำเตือนหรืออันตราย เพราะเป็นพฤติกรรมที่ถูกต้องของ addon UI
+- ผู้ใช้จะไม่เห็นข้อความนี้ในกล่อง Warnings แล้ว เว้นแต่จะมี warning อื่นจริง ๆ เช่น texture/geometry/animation หาย
