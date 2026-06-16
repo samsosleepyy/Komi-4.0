@@ -333,8 +333,8 @@ def _collect_source_pack(source_path: Path, extract_parent: Path, index: int) ->
         pass
 
     ui_hidden_item_ids = _collect_ui_hidden_item_ids(bp, mapping) if _looks_like_ui_converted_addon(bp) else set()
-    if ui_hidden_item_ids:
-        warnings.append(f'ตรวจพบ addon ที่เคยรวมไอเท็มเป็น UI แล้ว: จะคงการซ่อนไอเท็มจริงไว้ {len(ui_hidden_item_ids)} รายการ')
+    # This is expected behaviour, not a warning: UI-converted addons intentionally
+    # keep generated target items hidden so only the selector item appears in Creative.
     return SourcePack(index, source_path, extract_root, bp, rp, prefix, display, mapping, texture_key_mapping, texture_ref_mapping, script_entries, server_deps, warnings, ui_hidden_item_ids)
 
 
@@ -562,6 +562,24 @@ def _resize_item_texture_references(merged_rp: Path) -> None:
                     _resize_image_file(path)
 
 
+
+def _ui_addon_info_lines(sources: List[SourcePack]) -> List[str]:
+    """Return report note lines for UI-converted source addons.
+
+    These are informational and must not be placed under Warnings because
+    preserving hidden target items is the correct merge behaviour.
+    """
+    lines: List[str] = []
+    for source in sources:
+        hidden_count = len(source.ui_hidden_item_ids or set())
+        if hidden_count:
+            lines.append(
+                f'- Info: {source.source_path.name} already has a UI selector system; '
+                f'{hidden_count} generated target item(s) were kept hidden as expected.'
+            )
+    return lines
+
+
 def _normalize_merged_creative_visibility(merged_bp: Path, preserve_hidden_item_ids: Optional[Set[str]] = None) -> None:
     """Normalize Creative visibility after merging.
 
@@ -594,6 +612,44 @@ def _normalize_merged_creative_visibility(merged_bp: Path, preserve_hidden_item_
         else:
             desc['menu_category'] = {'category': 'equipment'}
         _write_json(path, data)
+
+
+
+def _make_merged_wearables_unbreakable(merged_bp: Path) -> int:
+    """Remove durability from custom wearable items in merged output.
+
+    UI mode creates generated wearable target items without minecraft:durability,
+    so they do not break. Merge mode should match that user-facing behaviour for
+    custom wearable armor as well: after rebuilding/merging, custom armor pieces
+    should not lose durability when used in-game. This intentionally leaves
+    non-wearable items untouched.
+    """
+    items_root = merged_bp / 'items'
+    if not items_root.exists():
+        return 0
+    changed = 0
+    for path in sorted(items_root.rglob('*.json')):
+        try:
+            data = _read_json(path)
+        except Exception:
+            continue
+        item = data.get('minecraft:item') if isinstance(data, dict) else None
+        if not isinstance(item, dict):
+            continue
+        desc = item.get('description') if isinstance(item.get('description'), dict) else {}
+        identifier = str(desc.get('identifier') or '') if isinstance(desc, dict) else ''
+        if identifier.startswith('minecraft:'):
+            continue
+        comps = item.get('components')
+        if not isinstance(comps, dict):
+            continue
+        if not isinstance(comps.get('minecraft:wearable'), dict):
+            continue
+        if 'minecraft:durability' in comps:
+            comps.pop('minecraft:durability', None)
+            _write_json(path, data)
+            changed += 1
+    return changed
 
 def _find_pack_icon_path(bp: Path, rp: Path) -> Optional[Path]:
     candidates: List[Path] = []
@@ -800,6 +856,7 @@ def merge_addons(addon_paths: List[str], work_dir: str, pack_name: Optional[str]
     for source in sources:
         preserve_hidden_item_ids.update(source.ui_hidden_item_ids)
     _normalize_merged_creative_visibility(merged_bp, preserve_hidden_item_ids)
+    unbreakable_count = _make_merged_wearables_unbreakable(merged_bp)
 
     # Merge item_texture.json.
     texture_data: Dict[str, Any] = {}
@@ -856,6 +913,8 @@ def merge_addons(addon_paths: List[str], work_dir: str, pack_name: Optional[str]
         '- Identifiers, defined geometry/animations/controllers, texture keys and texture paths are prefixed to reduce collisions.',
         '- Built-in references such as geometry.humanoid.customSlim are preserved.',
         '- If an uploaded addon already uses the UI selector system, its hidden target items stay hidden while normal addon items stay visible.',
+        f'- Custom wearable armor made unbreakable after merge: {unbreakable_count} item(s).' if unbreakable_count else '- Custom wearable armor durability: no durability components needed removal.',
+        *_ui_addon_info_lines(sources),
         '',
         'Warnings:',
         *(warnings or ['- No major warnings detected.']),
