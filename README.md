@@ -265,3 +265,15 @@ This avoids the Bedrock issue where hidden custom wearables can remain give-able
 - หากโหมดรวมแอดออนตรวจพบว่าไฟล์ต้นทางเคยถูกแปลงเป็น UI selector แล้ว ระบบจะรักษาการซ่อนไอเท็มจริงไว้ตามเดิม เพื่อให้เห็นเฉพาะไอเท็ม UI ใน Creative
 - ข้อความลักษณะนี้ไม่ถูกนับเป็นคำเตือนหรืออันตราย เพราะเป็นพฤติกรรมที่ถูกต้องของ addon UI
 - ผู้ใช้จะไม่เห็นข้อความนี้ในกล่อง Warnings แล้ว เว้นแต่จะมี warning อื่นจริง ๆ เช่น texture/geometry/animation หาย
+
+### Script / Function Preservation
+
+เมื่อรวมแอดออนหรือสร้าง UI addon ใหม่ บอทจะพยายามรักษา behavior ฝั่ง BP ของ addon ต้นทางด้วย:
+
+- script entry จาก manifest เช่น `scripts/main.js` หรือ `scripts/index.js` จะถูก import จาก `scripts/main.js` ใหม่
+- `BP/functions/tick.json` และ `BP/functions/load.json` จะถูกรวมกลับเป็นชื่อพิเศษเดิม ไม่ถูก rename เป็น `m1_tick.json`
+- `.mcfunction` ที่ถูกเรียกผ่าน tick/load จะถูก prefix ชื่อไฟล์เพื่อกันชนกัน แล้วปรับค่าใน tick/load ให้ชี้ชื่อใหม่
+- ในโหมด UI ถ้า mcfunction อ้าง item เดิมที่ถูกแยกเป็นหลาย slot บอทจะขยายคำสั่งพื้นฐานให้ครอบคลุม generated variants เท่าที่ทำได้
+
+หมายเหตุ: สคริปต์ JavaScript ที่ hard-code item identifier แบบซับซ้อนอาจยังต้องตรวจในเกมจริง เพราะบอทไม่สามารถเข้าใจ logic ของ script ที่ถูก obfuscate ได้ทุกกรณี
+
