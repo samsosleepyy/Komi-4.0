@@ -26,6 +26,7 @@ from discord.ext import commands
 from addon_processor import (
     AddonError,
     convert_addon,
+    convert_addons_to_ui,
     edit_existing_ui_addon,
     inspect_addon,
     inspect_existing_ui_addon,
@@ -66,8 +67,9 @@ ALLOWED_GUILDS: Set[int] = {
     int(x.strip()) for x in os.getenv("ALLOWED_GUILDS", "1420339720277463112,1441795602550882334").split(",") if x.strip().isdigit()
 }
 MAX_PARALLEL_JOBS = int(os.getenv("MAX_PARALLEL_JOBS", "1"))
-MIN_MERGE_ADDONS = 2
-MAX_MERGE_ADDONS = 5
+MIN_MERGE_ADDONS = 1
+MAX_MERGE_ADDONS = int(os.getenv("MAX_MERGE_ADDONS", "10"))
+MAX_UI_ADDONS = int(os.getenv("MAX_UI_ADDONS", "10"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
 MAX_MERGE_TOTAL_UPLOAD_BYTES = int(os.getenv("MAX_MERGE_TOTAL_UPLOAD_BYTES", str(75 * 1024 * 1024)))
 DISCORD_UPLOAD_LIMIT_BYTES = int(os.getenv("DISCORD_UPLOAD_LIMIT_BYTES", str(25 * 1024 * 1024)))
@@ -182,6 +184,144 @@ def _fit_embed_text(text: str, limit: int = 3600) -> str:
     if len(text) <= limit:
         return text
     return text[:limit - 40].rstrip() + "\n...ตัดข้อความ report บางส่วน"
+
+
+def _extract_warning_lines(report_text: str) -> list[str]:
+    """Extract only user-facing warnings from processor reports."""
+    lines = str(report_text or "").splitlines()
+    warnings: list[str] = []
+    in_warnings = False
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            if in_warnings:
+                continue
+            continue
+        if line.lower().rstrip(":") in {"warnings", "warning"}:
+            in_warnings = True
+            continue
+        if not in_warnings:
+            continue
+        if line.startswith("- "):
+            item = line[2:].strip()
+        else:
+            item = line.strip("- ").strip()
+        if not item:
+            continue
+        lower = item.lower()
+        if "no major warnings" in lower or "ไม่พบ warning" in lower:
+            continue
+        warnings.append(item)
+    # Keep order but remove duplicates so the Discord embed stays short.
+    return list(dict.fromkeys(warnings))
+
+
+def _warning_details(warning: str) -> tuple[str, str, str]:
+    w = str(warning or "")
+    lower = w.lower()
+    if "icon key/path" in lower or "auto_ui_pack_icon" in lower:
+        return (
+            "addon UI เวอร์ชันเก่าใช้ชื่อ icon key/path กลางเหมือนกัน ทำให้ชนกับ addon UI อื่นในโลกเดียวกัน",
+            "ถ้าไม่ได้แก้ ไอเท็ม UI หลายแพคอาจแสดงไอคอนเดียวกัน โดยมักเป็นภาพจากแพคที่โหลดก่อน",
+            "ไฟล์นี้ถูกแก้อัตโนมัติแล้ว สำหรับ addon UI เก่าตัวอื่นให้ส่งเข้า Edit Mode แล้วกดส่งออกใหม่อีกครั้ง",
+        )
+    if "pack_icon" in lower or "pack icon" in lower:
+        return (
+            "ไม่พบรูป pack_icon.png ที่ใช้ทำไอคอนหลักของแพคหรือไอเท็ม UI",
+            "ไอคอน UI อาจ fallback เป็นไอคอน item แรกหรือไอคอนสำรอง ทำให้ภาพไม่ตรงกับที่ต้องการ",
+            "ใช้ Edit Mode แล้วอัปโหลดรูปแพคใหม่ หรือใส่ pack_icon.png ใน BP/RP ต้นทางก่อนอัปโหลด",
+        )
+    if "attachable" in lower:
+        return (
+            "ไอเท็มต้นทางไม่มีไฟล์ attachable ที่บอกโมเดล/การแสดงผลตอนถือหรือสวมใส่",
+            "ไอเท็มอาจใส่ได้แต่โมเดลตอนถือ/สวมใส่อาจไม่ตรง หรือแสดงผลเป็นพื้นฐาน",
+            "ตรวจ Resource Pack ว่ามีไฟล์ RP/attachables ที่ผูกกับ item identifier นั้นครบ",
+        )
+    if "texture file" in lower or "icon texture" in lower or "texture" in lower:
+        return (
+            "มีการอ้างอิง texture ใน addon ต้นทาง แต่ไม่พบไฟล์รูปตาม path นั้น",
+            "บางไอคอนหรือบางส่วนของโมเดลอาจเป็นภาพหาย/สีม่วงดำ/ไม่แสดงตามต้องการ",
+            "ตรวจ textures/item, textures/models หรือ item_texture.json ให้ path ตรงกับไฟล์จริง",
+        )
+    if "geometry" in lower:
+        return (
+            "attachable อ้างอิง geometry แต่หาไฟล์โมเดลที่มี identifier นั้นไม่เจอ",
+            "โมเดลตอนสวมใส่อาจไม่ขึ้นหรือกลับไปใช้ reference เดิม ซึ่งอาจใช้ไม่ได้ในแพคใหม่",
+            "ตรวจ RP/models ว่ามี geometry identifier ที่ตรงกับ attachable ครบ",
+        )
+    if "animation" in lower:
+        return (
+            "attachable อ้างอิง animation แต่หาไฟล์ animation ที่ตรงกันไม่เจอ",
+            "ไอเท็มอาจยังใช้งานได้ แต่ animation บางส่วนอาจไม่ทำงาน",
+            "ตรวจ RP/animations ว่ามี animation id ที่ attachable อ้างถึงครบ",
+        )
+    if "render controller" in lower or "controller.render" in lower:
+        return (
+            "attachable อ้างอิง render controller แต่หาไฟล์นิยามไม่เจอ หรือมี reference ที่ไม่สามารถ rename ได้",
+            "โมเดล/วัสดุ/texture บางส่วนอาจแสดงผลไม่ครบในเกม",
+            "ตรวจ RP/render_controllers และ reference ใน attachable ให้ครบก่อนอัปโหลดใหม่",
+        )
+    if "wearable slot" in lower or "fallback" in lower:
+        return (
+            "slot เดิมของ item ไม่อยู่ในรายการที่บอทรู้จัก หรือ addon ใช้ค่า slot ที่ไม่มาตรฐาน",
+            "บอทจะเลือกช่องสำรองให้ ทำให้ไอเท็มอาจไปอยู่คนละช่องกับที่ผู้สร้างตั้งใจ",
+            "ใช้ตัวเลือกกำหนดช่องเองใน Review/Edit Mode แล้วเลือกช่องที่ต้องการ เช่น หัว/ตัว/กางเกง/รองเท้า/มือซ้าย",
+        )
+    if "ซ่อน" in w:
+        return (
+            "ช่องที่เลือกใน Edit Mode ไม่ตรงกับ variant บางตัวที่มีอยู่ใน UI เดิม",
+            "รายการนั้นจะไม่แสดงในเมนู UI แต่ไฟล์ item อาจยังอยู่ในแพคและถูกซ่อนไว้",
+            "กลับไปเลือกช่องเพิ่ม หรือใช้โหมดใส่ได้ทุกช่องถ้าต้องการให้แสดงครบ",
+        )
+    if "ui ซ้ำ" in w or "ทำ ui ซ้ำ" in w:
+        return (
+            "พบรายการที่น่าจะเกิดจากการนำ addon UI เดิมไปทำ UI ซ้ำอีกครั้ง",
+            "ถ้าไม่ซ่อม เมนูจะมีรายการซ้ำและชื่อ item อาจต่อท้ายช่องหลายชั้น",
+            "บอทซ่อมให้แล้วในไฟล์นี้ ต่อไปให้อัปโหลด addon UI เดิมเพื่อเข้า Edit Mode แทนการทำ UI ซ้ำ",
+        )
+    return (
+        "addon ต้นทางมีข้อมูลบางส่วนที่บอทอ่านหรือย้ายมาแพคใหม่ได้ไม่สมบูรณ์",
+        "ไฟล์อาจยังใช้งานได้ แต่บางไอเท็ม/ภาพ/โมเดล/animation อาจไม่ตรงกับต้นฉบับ",
+        "ลองทดสอบในโลกสำรองก่อนใช้งานจริง ถ้าพบปัญหาให้แก้ไฟล์ต้นทางตาม warning หรือส่ง Job ID ให้แอดมินตรวจต่อ",
+    )
+
+
+async def send_user_warnings_from_report(
+    channel: discord.abc.Messageable,
+    state: dict,
+    report_text: str,
+    *,
+    context_title: str = "Warnings",
+) -> None:
+    warnings = _extract_warning_lines(report_text)
+    if not warnings:
+        return
+    shown = warnings[:5]
+    extra = len(warnings) - len(shown)
+    embed = discord.Embed(
+        title=f"⚠️ {context_title}",
+        description=(
+            "บอทสร้างไฟล์ให้แล้ว แต่พบคำเตือนบางอย่างจาก addon ต้นทาง\n"
+            f"Job ID: {_job_label(state)}\n\n"
+            "คำเตือนเหล่านี้ไม่ได้แปลว่าไฟล์ใช้ไม่ได้เสมอไป แต่ควรอ่านก่อนนำไปใช้จริง"
+        ),
+        color=discord.Color.orange(),
+    )
+    for idx, warning in enumerate(shown, start=1):
+        cause, effect, fix = _warning_details(warning)
+        value = (
+            f"**Warning:** {warning[:260]}\n"
+            f"**สาเหตุ:** {cause}\n"
+            f"**ผลถ้านำไปใช้:** {effect}\n"
+            f"**วิธีแก้:** {fix}"
+        )
+        embed.add_field(name=f"คำเตือน {idx}", value=value[:1024], inline=False)
+    if extra > 0:
+        embed.set_footer(text=f"ยังมี warning เพิ่มอีก {extra} รายการ ดูรายละเอียดเต็มได้จาก log ของแอดมิน")
+    try:
+        await channel.send(embed=embed)
+    except Exception as exc:
+        print(f"Failed to send user warnings: {exc}")
 
 
 def _new_job_id(prefix: str) -> str:
@@ -547,7 +687,7 @@ def reset_ticket_timer(channel: discord.TextChannel, state: dict, delay: int) ->
 
 
 def mode_label(mode: str) -> str:
-    return f"รวมแอดออน {MIN_MERGE_ADDONS}-{MAX_MERGE_ADDONS} ไฟล์" if mode == "merge_addons" else "รวมไอเท็มเป็น UI"
+    return f"รวมแอดออน 1-{MAX_MERGE_ADDONS} ไฟล์" if mode == "merge_addons" else f"รวมไอเท็มเป็น UI 1-{MAX_UI_ADDONS} ไฟล์"
 
 
 async def create_ticket(interaction: discord.Interaction, mode: str) -> None:
@@ -598,9 +738,9 @@ async def create_ticket(interaction: discord.Interaction, mode: str) -> None:
     await interaction.response.send_message(f"สร้างช่องแล้ว: {channel.mention}", ephemeral=True)
     if mode == "merge_addons":
         await channel.send(
-            f"{interaction.user.mention} โหมด **รวมแอดออน 2-5 ไฟล์**\n"
+            f"{interaction.user.mention} โหมด **รวมแอดออน 1-10 ไฟล์**\n"
             f"Job ID: `{job_id}`\n"
-            "อัปโหลด `.mcaddon` หรือ `.zip` ได้ 2-5 ไฟล์ในช่องนี้ได้เลย\n"
+            "อัปโหลด `.mcaddon` หรือ `.zip` ได้ 1-10 ไฟล์ในช่องนี้ได้เลย\n"
             "เมื่อส่งไฟล์แล้วบอทจะแสดง embed preview ให้แก้ชื่อแพค/รูปก่อนกดเริ่มสร้าง\n"
             "ช่องนี้มีเวลา 3 นาทีก่อนจะโดนลบ ถ้าเริ่มส่งไฟล์แล้วเวลาลบอัตโนมัติจะหยุดจนกว่าบอททำงานเสร็จ"
         )
@@ -608,7 +748,8 @@ async def create_ticket(interaction: discord.Interaction, mode: str) -> None:
         await channel.send(
             f"{interaction.user.mention} โหมด **รวมไอเท็มเป็น UI**\n"
             f"Job ID: `{job_id}`\n"
-            "อัปโหลดแอดออน `.mcaddon` หรือ `.zip` ลงในช่องได้เลย\n"
+            "อัปโหลดแอดออน `.mcaddon` หรือ `.zip` ได้ 1-10 ไฟล์ในช่องนี้ได้เลย\n"
+            "ถ้าอัปโหลดหลายไฟล์และแต่ละไฟล์มีไอเท็ม บอทจะถามก่อนว่าจะรวมไอเท็มจากทุกไฟล์ให้เป็น UI เดียวหรือไม่\n"
             "ช่องนี้มีเวลา 3 นาทีก่อนจะโดนลบ หากส่งไฟล์แล้วเวลาลบอัตโนมัติจะหยุดจนกว่าบอทจะแปลงเสร็จ"
         )
 
@@ -617,7 +758,7 @@ class PanelModeSelect(discord.ui.Select):
     def __init__(self):
         options = [
             discord.SelectOption(label="รวมไอเท็มเป็น UI", value="combine_ui", description="แปลง addon ที่มีหลายไอเท็มให้เป็นไอเท็ม UI อัตโนมัติ", emoji="🎨"),
-            discord.SelectOption(label="รวมแอดออน", value="merge_addons", description="รวม addon ได้สูงสุด 5 ไฟล์เป็น addon เดียว พร้อมกันชื่อ/ไฟล์ชน", emoji="📦"),
+            discord.SelectOption(label="รวมแอดออน", value="merge_addons", description="รวม addon ได้สูงสุด 10 ไฟล์เป็น addon เดียว พร้อมกันชื่อ/ไฟล์ชน", emoji="📦"),
         ]
         super().__init__(placeholder="เลือกโหมดที่ต้องการใช้งาน", min_values=1, max_values=1, options=options, custom_id="addon_tools:mode_select")
 
@@ -1222,6 +1363,8 @@ async def run_existing_ui_edit_job(interaction: discord.Interaction, state: dict
             await interaction.followup.send(f"แก้ไข addon UI เดิมเสร็จแล้ว โหมด: **{mode_label}**", file=discord.File(edited_path))
             sent_ok = True
         report_text = _read_webhook_report(work_dir, "UI_EDIT_REPORT_WEBHOOK.txt")
+        if isinstance(channel, discord.TextChannel):
+            await send_user_warnings_from_report(channel, state, report_text, context_title="Warnings จากการแก้ไข addon UI")
         webhook_description = "แก้ไข addon UI เดิมสำเร็จ"
         if report_text:
             webhook_description += "\n\nReport:\n```text\n" + _fit_embed_text(report_text, 3200) + "\n```"
@@ -1259,9 +1402,13 @@ class ItemReviewSelect(discord.ui.Select):
         self.ticket_channel_id = ticket_channel_id
         options = []
         for c in candidates[:25]:
-            label = c["display_name"][:100] or c["identifier"][:100]
-            desc = c["file_path"][:100]
-            options.append(discord.SelectOption(label=label, value=c["identifier"], description=desc, emoji="📄"))
+            label = (c.get("display_name") or c.get("identifier") or "item")[:100]
+            source_name = str(c.get("source_file_name") or "")
+            desc_base = source_name or str(c.get("file_path") or "")
+            if source_name and c.get("wearable_slot"):
+                desc_base = f"{source_name} • {c.get('wearable_slot')}"
+            value = str(c.get("option_value") or c.get("identifier") or "")[:100]
+            options.append(discord.SelectOption(label=label, value=value, description=desc_base[:100], emoji="📄"))
         super().__init__(placeholder="เลือกไอเท็มที่จะรวมเข้า UI", min_values=1, max_values=max(1, len(options)), options=options, custom_id=f"addon_ui:select:{ticket_channel_id}")
 
     async def callback(self, interaction: discord.Interaction):
@@ -1278,7 +1425,7 @@ class ItemReviewSelect(discord.ui.Select):
         state.pop("custom_slots", None)
 
         candidates = list(state.get("inspection") or [])
-        selected_candidates = [c for c in candidates if c.get("identifier") in selected_ids]
+        selected_candidates = [c for c in candidates if str(c.get("option_value") or c.get("identifier")) in selected_ids]
         has_wearable = any((c.get("item_kind") or "wearable") != "offhand" for c in selected_candidates)
         if selected_candidates and not has_wearable:
             state["slot_mode"] = "original"
@@ -1287,9 +1434,13 @@ class ItemReviewSelect(discord.ui.Select):
             await run_ui_convert_job(interaction, state)
             return
 
-        selected_text = "\n".join(f"• `{x}`" for x in selected_ids[:12])
-        if len(selected_ids) > 12:
-            selected_text += f"\n-# และอีก {len(selected_ids)-12} รายการ"
+        def _selected_label(c: dict) -> str:
+            name = c.get("display_name") or c.get("identifier") or "item"
+            src = c.get("source_file_name")
+            return f"• **{name}**" + (f" จาก `{src}`" if src else "")
+        selected_text = "\n".join(_selected_label(c) for c in selected_candidates[:12])
+        if len(selected_candidates) > 12:
+            selected_text += f"\n-# และอีก {len(selected_candidates)-12} รายการ"
         embed = discord.Embed(
             title="⚙️ เลือกวิธีตั้งช่องสวมใส่",
             description=(
@@ -1320,10 +1471,11 @@ async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> N
     custom_slots = list(state.get("custom_slots") or [])
     work_dir = state.get("work_dir")
     source_file = state.get("source_file")
+    source_files = list(state.get("source_files") or ([] if not source_file else [source_file]))
     if not selected_ids:
         await interaction.followup.send("ยังไม่ได้เลือกไอเท็มที่จะรวมเข้า UI")
         return
-    if not work_dir or not source_file:
+    if not work_dir or not source_files:
         await interaction.followup.send("ไม่พบไฟล์ต้นฉบับใน ticket นี้")
         return
     progress = ProgressReporter(channel, state, "🎨 สถานะงานรวมไอเท็มเป็น UI") if isinstance(channel, discord.TextChannel) else None
@@ -1336,7 +1488,9 @@ async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> N
         async with convert_semaphore:
             if progress:
                 await progress.set("🎨 กำลังสร้าง addon UI ใหม่ กรุณารอสักครู่...", force=True)
-            converted = await asyncio.to_thread(convert_addon, source_file, selected_ids, work_dir, slot_mode, custom_slots)
+            ref_map = state.get("candidate_ref_map") or {}
+            selected_refs = [str(ref_map.get(x, {}).get("ref") or x) for x in selected_ids]
+            converted = await asyncio.to_thread(convert_addons_to_ui, source_files, selected_refs, work_dir, slot_mode, custom_slots)
         converted_path = Path(converted)
         mode_label = {
             "original": "คงช่องเดิม",
@@ -1360,6 +1514,8 @@ async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> N
             )
             sent_ok = True
         report_text = _read_webhook_report(work_dir, "NORMALIZE_REPORT_WEBHOOK.txt")
+        if isinstance(channel, discord.TextChannel):
+            await send_user_warnings_from_report(channel, state, report_text, context_title="Warnings จากการรวมไอเท็มเป็น UI")
         webhook_description = "แปลง addon เป็น UI สำเร็จ"
         if report_text:
             webhook_description += "\n\nReport:\n```text\n" + _fit_embed_text(report_text, 3200) + "\n```"
@@ -1371,11 +1527,15 @@ async def run_ui_convert_job(interaction: discord.Interaction, state: dict) -> N
                 ("User", f"{interaction.user}\n`{interaction.user.id}`", False),
                 ("Job ID", str(state.get("job_id") or "-"), True),
                 ("Guild", f"{interaction.guild.name if interaction.guild else 'DM'}\n`{interaction.guild.id if interaction.guild else 'DM'}`", False),
-                ("Selected Items", "\n".join(f"`{x}`" for x in selected_ids)[:1024], False),
+                ("Selected Items", "\n".join(
+                    f"`{(state.get('candidate_ref_map') or {}).get(x, {}).get('identifier') or x}`"
+                    + (f" จาก {(state.get('candidate_ref_map') or {}).get(x, {}).get('source_file_name')}" if (state.get('candidate_ref_map') or {}).get(x, {}).get('source_file_name') else "")
+                    for x in selected_ids
+                )[:1024], False),
                 ("Slot Mode", mode_label, True),
                 ("Custom Slots", ", ".join(custom_slots) if custom_slots else "-", True),
             ],
-            files=[Path(source_file), converted_path],
+            files=[Path(p) for p in source_files if Path(p).exists()] + [converted_path],
         )
     except Exception as exc:
         state["convert_running"] = False
@@ -1480,6 +1640,76 @@ class CustomSlotReviewView(discord.ui.View):
         self.add_item(CustomSlotSelect(ticket_channel_id))
 
 
+def _ui_review_embed(state: dict, *, multi_intro: bool = False) -> discord.Embed:
+    candidates = list(state.get("inspection") or [])
+    source_files = list(state.get("source_files") or [])
+    file_count = len(source_files) or (1 if state.get("source_file") else 0)
+    lines: list[str] = []
+    for i, c in enumerate(candidates[:25], start=1):
+        src = c.get("source_file_name")
+        slot = c.get("wearable_slot") or ("มือซ้าย" if c.get("item_kind") == "offhand" else "ไม่ระบุ")
+        source_text = f" จาก `{src}`" if src and file_count > 1 else ""
+        lines.append(f"`{i}.` **{c.get('display_name') or c.get('identifier') or 'item'}**{source_text} - `{slot}`\n-# {c.get('file_path') or '-'}")
+    if len(candidates) > 25:
+        lines.append(f"\nพบ {len(candidates)} ไอเท็ม แต่ Discord dropdown แสดงได้ครั้งละ 25 ตัวเลือก ตอนนี้แสดง 25 รายการแรก")
+    title = "📄 Review Mode: เลือกไอเท็มที่จะรวมเข้า UI"
+    description = "\n".join(lines) or "ไม่พบรายการ"
+    if multi_intro:
+        description = (
+            f"พบ addon `{file_count}` ไฟล์ และพบไอเท็มที่รวมเข้า UI ได้ `{len(candidates)}` รายการ\n"
+            "กดปุ่มด้านล่างเพื่อยืนยันว่าจะรวมไอเท็มจากไฟล์เหล่านี้เป็น UI เดียว แล้วเลือกไอเท็มในขั้นต่อไป\n\n"
+            + description
+        )
+    embed = discord.Embed(title=title, description=description[:4096], color=discord.Color.green())
+    embed.set_footer(text=f"รองรับ UI หลายไฟล์สูงสุด {MAX_UI_ADDONS} ไฟล์ • เลือกได้สูงสุด 25 รายการต่อรอบ")
+    return embed
+
+
+async def _send_ui_item_review(channel: discord.TextChannel, state: dict) -> None:
+    await channel.send(embed=_ui_review_embed(state), view=ItemReviewView(channel.id, list(state.get("inspection") or [])))
+
+
+class MultiUiConfirmView(discord.ui.View):
+    def __init__(self, ticket_channel_id: int):
+        super().__init__(timeout=600)
+        self.ticket_channel_id = ticket_channel_id
+
+    async def _get_state(self, interaction: discord.Interaction) -> Optional[dict]:
+        state = TICKETS.get(self.ticket_channel_id)
+        if not state:
+            await interaction.response.send_message("ticket หมดอายุแล้ว", ephemeral=True)
+            return None
+        if interaction.user.id != state.get("user_id"):
+            await interaction.response.send_message("เฉพาะเจ้าของ ticket เท่านั้นที่ใช้ปุ่มนี้ได้", ephemeral=True)
+            return None
+        return state
+
+    @discord.ui.button(label="รวมไฟล์เหล่านี้เป็น UI เดียว", style=discord.ButtonStyle.success, emoji="🎨")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self._get_state(interaction)
+        if not state:
+            return
+        state["ui_multi_confirmed"] = True
+        await interaction.response.defer(thinking=False)
+        if isinstance(interaction.channel, discord.TextChannel):
+            await _send_ui_item_review(interaction.channel, state)
+            reset_ticket_timer(interaction.channel, state, ACTIVE_TICKET_TTL)
+
+    @discord.ui.button(label="ยกเลิก", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self._get_state(interaction)
+        if not state:
+            return
+        _cleanup_work_dir(state.get("work_dir"))
+        state["work_dir"] = None
+        state["source_file"] = None
+        state["source_files"] = []
+        state["inspection"] = None
+        await interaction.response.send_message("ยกเลิกการรวมหลายไฟล์แล้ว อัปโหลดไฟล์ใหม่ได้เลย", ephemeral=False)
+        if isinstance(interaction.channel, discord.TextChannel):
+            reset_ticket_timer(interaction.channel, state, INITIAL_TICKET_TTL)
+
+
 _COMMANDS_SYNCED = False
 _STALE_TICKETS_CLEANED = False
 
@@ -1521,10 +1751,10 @@ async def setup(interaction: discord.Interaction, category: discord.CategoryChan
         description=(
             "เลือกโหมดจากเมนูด้านล่าง แล้วบอทจะเปิด ticket ส่วนตัวให้คุณอัปโหลดไฟล์ addon\n\n"
             "🎨 **รวมไอเท็มเป็น UI**\n"
-            "สำหรับ addon ที่มีไอเท็มสวมใส่หรือไอเท็มถือมือรองหลายชิ้น บอทจะตรวจไฟล์ที่อัปโหลด แสดงรายการไอเท็มให้เลือก แล้วสร้าง addon ใหม่ที่มีไอเท็มเมนูเพียงชิ้นเดียว ใช้กดเปิดหน้าต่างเลือกไอเท็มในเกมได้สะดวกขึ้น\n"
+            "สำหรับ addon ที่มีไอเท็มสวมใส่หรือไอเท็มถือมือรองหลายชิ้น บอทจะตรวจไฟล์ที่อัปโหลด แสดงรายการไอเท็มให้เลือก แล้วสร้าง addon ใหม่ที่มีไอเท็มเมนูเพียงชิ้นเดียว ใช้กดเปิดหน้าต่างเลือกไอเท็มในเกมได้สะดวกขึ้น รองรับการอัปโหลด 1-10 ไฟล์ในครั้งเดียว และถ้ามีไอเท็มจากหลายไฟล์ บอทจะถามก่อนว่าจะรวมเป็น UI เดียวหรือไม่\n"
             "ถ้าอัปโหลด addon ที่เคยทำ UI แล้ว บอทจะเข้าโหมดแก้ไขให้แทน สามารถเปลี่ยนช่องที่แสดงใน UI แก้ชื่อแพค แก้รูปแพค แก้ชื่อไอเท็ม และเพิ่มไอเท็มจาก addon ปกติอื่นเข้าไปได้ โดยไม่สร้างไอเท็มซ้ำ\n\n"
             "📦 **รวมแอดออน**\n"
-            "สำหรับคนที่มี addon หลายไฟล์ บอทจะรวมได้ 2-5 ไฟล์เป็นไฟล์เดียว พร้อมจัดชื่อและไฟล์ภายในใหม่เพื่อลดปัญหา addon ชนกัน จากนั้นส่งไฟล์ที่รวมเสร็จกลับมาให้ดาวน์โหลด\n\n"
+            "สำหรับคนที่มี addon หลายไฟล์ บอทจะรวมได้ 1-10 ไฟล์เป็นไฟล์เดียว พร้อมจัดชื่อและไฟล์ภายในใหม่เพื่อลดปัญหา addon ชนกัน จากนั้นส่งไฟล์ที่รวมเสร็จกลับมาให้ดาวน์โหลด\n\n"
             "🔒 **ความเป็นส่วนตัว**\n"
             "บอทไม่ได้บันทึกข้อมูลส่วนตัวของผู้ใช้ และไม่เก็บไฟล์ addon ไว้ถาวร ไฟล์ที่อัปโหลดจะใช้เพื่อประมวลผลใน ticket นี้เท่านั้น แล้วระบบจะลบไฟล์ชั่วคราวหลังงานเสร็จหรือเมื่อ ticket หมดเวลา"
         ),
@@ -1549,18 +1779,34 @@ def _valid_addon_attachments(message: discord.Message) -> list[discord.Attachmen
 
 
 async def handle_combine_ui_message(message: discord.Message, state: dict, attachments: list[discord.Attachment]) -> None:
-    attachment = attachments[0]
-    if attachment.size and attachment.size > MAX_UPLOAD_BYTES:
-        await message.channel.send(f"ไฟล์ใหญ่เกินกำหนด ({_format_bytes(attachment.size)} / สูงสุด {_format_bytes(MAX_UPLOAD_BYTES)}) กรุณาลดขนาด addon แล้วอัปโหลดใหม่")
+    if len(attachments) > MAX_UI_ADDONS:
+        await message.channel.send(f"โหมดรวมไอเท็มเป็น UI รองรับสูงสุด {MAX_UI_ADDONS} ไฟล์ต่อครั้ง กรุณาลดจำนวนไฟล์แล้วอัปโหลดใหม่")
+        if isinstance(message.channel, discord.TextChannel):
+            reset_ticket_timer(message.channel, state, INITIAL_TICKET_TTL)
+        return
+    too_large = [a for a in attachments if a.size and a.size > MAX_UPLOAD_BYTES]
+    if too_large:
+        names = ", ".join(f"{a.filename} ({_format_bytes(a.size)})" for a in too_large[:3])
+        await message.channel.send(f"มีไฟล์ใหญ่เกินกำหนดสูงสุด {_format_bytes(MAX_UPLOAD_BYTES)} ต่อไฟล์: {names}")
+        if isinstance(message.channel, discord.TextChannel):
+            reset_ticket_timer(message.channel, state, INITIAL_TICKET_TTL)
+        return
+    incoming_total = sum(int(a.size or 0) for a in attachments)
+    if incoming_total > MAX_MERGE_TOTAL_UPLOAD_BYTES:
+        await message.channel.send(f"ขนาดไฟล์รวมเกินกำหนด ({_format_bytes(incoming_total)} / สูงสุด {_format_bytes(MAX_MERGE_TOTAL_UPLOAD_BYTES)}) กรุณาลดจำนวนหรือขนาดไฟล์")
         if isinstance(message.channel, discord.TextChannel):
             reset_ticket_timer(message.channel, state, INITIAL_TICKET_TTL)
         return
     if isinstance(message.channel, discord.TextChannel):
         reset_ticket_timer(message.channel, state, ACTIVE_TICKET_TTL)
+
     _cleanup_work_dir(state.get("work_dir"))
     state["work_dir"] = None
     state["source_file"] = None
+    state["source_files"] = []
     state["inspection"] = None
+    state["candidate_ref_map"] = {}
+    state["ui_multi_confirmed"] = False
     state["ui_edit_inspection"] = None
     state["awaiting_ui_edit_icon"] = False
     state.pop("ui_edit_preview_message_id", None)
@@ -1577,16 +1823,44 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
     state.pop("ui_edit_add_source_file", None)
     state.pop("ui_edit_add_candidates", None)
     state.pop("ui_edit_add_selected_ids", None)
-    job_dir = Path(tempfile.mkdtemp(prefix=f"addon_ui_{message.author.id}_", dir=TEMP_ROOT))
-    source_file = job_dir / attachment.filename
-    try:
-        await attachment.save(source_file)
-        state["work_dir"] = str(job_dir)
-        state["source_file"] = str(source_file)
-        await message.channel.send("ได้รับไฟล์แล้ว กำลังตรวจสอบโครงสร้าง addon...")
 
-        existing_ui = await asyncio.to_thread(inspect_existing_ui_addon, str(source_file), str(job_dir))
-        if existing_ui is not None:
+    job_dir = Path(tempfile.mkdtemp(prefix=f"addon_ui_{message.author.id}_", dir=TEMP_ROOT))
+    saved_files: list[Path] = []
+    try:
+        for idx, attachment in enumerate(attachments, start=1):
+            target = job_dir / attachment.filename
+            if target.exists():
+                target = job_dir / f"{idx}_{attachment.filename}"
+            await attachment.save(target)
+            saved_files.append(target)
+        state["work_dir"] = str(job_dir)
+        state["source_files"] = [str(p) for p in saved_files]
+        state["source_file"] = str(saved_files[0]) if saved_files else None
+        await message.channel.send(f"ได้รับ {len(saved_files)} ไฟล์แล้ว กำลังตรวจสอบโครงสร้าง addon...")
+
+        # Existing UI addons should be edited one file at a time. When users want
+        # to add items into an existing UI addon, Edit Mode already has a dedicated
+        # ➕ เพิ่มไอเท็ม flow, which avoids reconverting hidden UI items by mistake.
+        existing_infos = []
+        for source_file in saved_files:
+            existing_ui = await asyncio.to_thread(inspect_existing_ui_addon, str(source_file), str(job_dir / f"existing_ui_check_{source_file.stem}"))
+            if existing_ui is not None:
+                existing_infos.append((source_file, existing_ui))
+        if existing_infos and len(saved_files) > 1:
+            await message.channel.send(
+                "ตรวจพบว่ามีไฟล์ที่เป็น addon UI อยู่แล้วในชุดที่อัปโหลด\n"
+                "ถ้าต้องการแก้ UI เดิมหรือเพิ่มไอเท็มเข้า UI เดิม ให้ส่ง addon UI เพียงไฟล์เดียวก่อนเพื่อเข้า **Edit Mode** แล้วกดปุ่ม **➕ เพิ่มไอเท็ม**"
+            )
+            _cleanup_work_dir(job_dir)
+            state["work_dir"] = None
+            state["source_file"] = None
+            state["source_files"] = []
+            if isinstance(message.channel, discord.TextChannel):
+                reset_ticket_timer(message.channel, state, INITIAL_TICKET_TTL)
+            return
+
+        if existing_infos and len(saved_files) == 1:
+            source_file, existing_ui = existing_infos[0]
             info = asdict(existing_ui)
             state["ui_edit_inspection"] = info
             state["inspection"] = None
@@ -1607,7 +1881,7 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
                     ("User", f"{message.author}\n`{message.author.id}`", False),
                     ("Job ID", str(state.get("job_id") or "-"), True),
                     ("Guild", f"{message.guild.name if message.guild else 'DM'}\n`{message.guild.id if message.guild else 'DM'}`", False),
-                    ("File", attachment.filename, True),
+                    ("File", source_file.name, True),
                     ("UI Items", str(info.get("item_count", 0)), True),
                     ("Current Slot Mode", str(info.get("current_slot_mode_label") or "-"), True),
                 ],
@@ -1620,34 +1894,59 @@ async def handle_combine_ui_message(message: discord.Message, state: dict, attac
                 await message.channel.send(embed=_ui_edit_preview_embed(state), view=ExistingUiEditView(message.channel.id, info))
             return
 
-        inspection = await asyncio.to_thread(inspect_addon, str(source_file), str(job_dir))
-        candidates = [asdict(c) for c in inspection.candidates]
-        state["inspection"] = candidates
+        all_candidates: list[dict] = []
+        ref_map: dict[str, dict] = {}
+        token_counter = 0
+        files_with_items = 0
+        for source_index, source_file in enumerate(saved_files, start=1):
+            inspection = await asyncio.to_thread(inspect_addon, str(source_file), str(job_dir / f"inspect_{source_index}"))
+            candidates = [asdict(c) for c in inspection.candidates]
+            if candidates:
+                files_with_items += 1
+            for c in candidates:
+                token = f"c{token_counter}"
+                token_counter += 1
+                c["source_index"] = source_index
+                c["source_file_name"] = source_file.name
+                c["option_value"] = token
+                ref = f"{source_index}:{c.get('identifier')}"
+                c["convert_ref"] = ref
+                ref_map[token] = {"ref": ref, "identifier": c.get("identifier"), "source_index": source_index, "display_name": c.get("display_name"), "source_file_name": source_file.name}
+                all_candidates.append(c)
+
+        if not all_candidates:
+            raise AddonError("ไม่พบไอเท็มที่แปลงได้ (ต้องเป็นเกราะ minecraft:wearable หรือไอเท็มที่เปิด minecraft:allow_off_hand)")
+        state["inspection"] = all_candidates
+        state["candidate_ref_map"] = ref_map
         state["ui_edit_inspection"] = None
         await send_webhook_log(
             title="Addon Uploaded for UI",
             description="มีผู้ใช้อัปโหลด addon สำหรับแปลงเป็น UI",
             color=0x5865F2,
-            fields=[("User", f"{message.author}\n`{message.author.id}`", False), ("Job ID", str(state.get("job_id") or "-"), True), ("Guild", f"{message.guild.name if message.guild else 'DM'}\n`{message.guild.id if message.guild else 'DM'}`", False), ("File", attachment.filename, True), ("Detected Items", str(len(candidates)), True)],
-            files=[source_file],
+            fields=[
+                ("User", f"{message.author}\n`{message.author.id}`", False),
+                ("Job ID", str(state.get("job_id") or "-"), True),
+                ("Guild", f"{message.guild.name if message.guild else 'DM'}\n`{message.guild.id if message.guild else 'DM'}`", False),
+                ("Files", str(len(saved_files)), True),
+                ("Detected Items", str(len(all_candidates)), True),
+            ],
+            files=saved_files,
         )
-        desc = "\n".join(
-            f"`{i+1}.` **{c['display_name']}** - `{c.get('wearable_slot') or ('มือซ้าย' if c.get('item_kind') == 'offhand' else 'ไม่ระบุ')}`\n-# {c['file_path']}"
-            for i, c in enumerate(candidates[:25])
-        )
-        if len(candidates) > 25:
-            desc += f"\n\nพบ {len(candidates)} ไอเท็ม แต่ Discord dropdown แสดงได้ครั้งละ 25 ตัวเลือก ตอนนี้แสดง 25 รายการแรก"
-        embed = discord.Embed(title="📄 Review Mode: เลือกไอเท็มที่จะรวมเข้า UI", description=desc or "ไม่พบรายการ", color=discord.Color.green())
-        await message.channel.send(embed=embed, view=ItemReviewView(message.channel.id, candidates))
+        if len(saved_files) > 1 and files_with_items >= 2:
+            embed = _ui_review_embed(state, multi_intro=True)
+            await message.channel.send(embed=embed, view=MultiUiConfirmView(message.channel.id))
+        else:
+            await _send_ui_item_review(message.channel, state)  # type: ignore[arg-type]
         if isinstance(message.channel, discord.TextChannel):
             reset_ticket_timer(message.channel, state, ACTIVE_TICKET_TTL)
     except Exception as exc:
         user_message = _humanize_addon_error(exc, mode="ui")
         await message.channel.send(f"ตรวจสอบ/อ่าน addon ไม่สำเร็จ:\n```text\n{user_message[:1800]}\n```\nJob ID: {_job_label(state)}")
-        await send_webhook_log(title="Addon UI Inspect Failed", description=str(exc), color=0xED4245, fields=[("User", f"{message.author}\n`{message.author.id}`", False), ("Job ID", str(state.get("job_id") or "-"), True)], files=[source_file] if source_file.exists() else None)
+        await send_webhook_log(title="Addon UI Inspect Failed", description=str(exc), color=0xED4245, fields=[("User", f"{message.author}\n`{message.author.id}`", False), ("Job ID", str(state.get("job_id") or "-"), True)], files=saved_files if saved_files else None)
         _cleanup_work_dir(job_dir)
         state["work_dir"] = None
         state["source_file"] = None
+        state["source_files"] = []
         if isinstance(message.channel, discord.TextChannel):
             reset_ticket_timer(message.channel, state, INITIAL_TICKET_TTL)
 
@@ -1787,7 +2086,7 @@ def _merge_preview_embed(state: dict) -> discord.Embed:
     )
     if state.get("merge_icon_url"):
         embed.set_thumbnail(url=state["merge_icon_url"])
-    for addon in addons[:5]:
+    for addon in addons[:10]:
         icon_text = "มี" if addon.get("pack_icon") else "ไม่มี"
         value = (
             f"**ชื่อแพค:** {addon.get('pack_name', 'ไม่ระบุ')}\n"
@@ -1955,6 +2254,7 @@ async def run_merge_job(channel: discord.TextChannel, user: discord.abc.User, st
         )
         guild = channel.guild if isinstance(channel, discord.TextChannel) else None
         report_text = _read_webhook_report(state.get("work_dir"), "MERGE_REPORT_WEBHOOK.txt")
+        await send_user_warnings_from_report(channel, state, report_text, context_title="Warnings จากการรวมแอดออน")
         webhook_description = f"รวม addon {len(source_files)} ไฟล์สำเร็จ"
         if report_text:
             webhook_description += "\n\nReport:\n```text\n" + _fit_embed_text(report_text, 3200) + "\n```"
