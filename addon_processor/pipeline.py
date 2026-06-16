@@ -1878,6 +1878,212 @@ def _lang_label(display_name: str, slot_key: str) -> str:
     return f"{display_name} ({slot_th})"
 
 
+
+
+def _ui_copy_text_or_binary(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+def _ui_function_output_ref(rel_to_functions: Path, source_index: int) -> str:
+    rel = Path(rel_to_functions)
+    return rel.with_name(f"s{source_index:02d}_{rel.name}").with_suffix("").as_posix()
+
+
+def _ui_collect_function_ref_mapping(bp: Path, source_index: int) -> Dict[str, str]:
+    functions = bp / "functions"
+    mapping: Dict[str, str] = {}
+    if not functions.exists():
+        return mapping
+    for fn in sorted(functions.rglob("*.mcfunction")):
+        rel = fn.relative_to(functions)
+        old_ref = rel.with_suffix("").as_posix()
+        new_ref = _ui_function_output_ref(rel, source_index)
+        mapping[old_ref] = new_ref
+        if len(rel.parts) == 1:
+            mapping[rel.stem] = new_ref
+    return mapping
+
+
+def _ui_map_function_ref(ref: str, function_map: Dict[str, str]) -> str:
+    clean = str(ref or "").strip()
+    if not clean:
+        return clean
+    suffix = ""
+    if clean.endswith(".mcfunction"):
+        clean, suffix = clean[:-11], ".mcfunction"
+    if clean in function_map:
+        return function_map[clean] + suffix
+    if ":" in clean:
+        ns, path = clean.split(":", 1)
+        if path in function_map:
+            return f"{ns}:{function_map[path]}" + suffix
+    return ref
+
+
+def _ui_patch_function_calls(text: str, function_map: Dict[str, str]) -> str:
+    if not function_map:
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        prefix, ref = match.group(1), match.group(2)
+        return prefix + _ui_map_function_ref(ref, function_map)
+
+    return re.sub(r"((?:^|\s)/?function\s+)([^\s#]+)", repl, text)
+
+
+def _ui_expand_item_ids_in_mcfunction(text: str, multi_item_map: Dict[str, List[str]]) -> str:
+    """Duplicate simple mcfunction lines when a selected source item became variants.
+
+    Example: clear @s custom:m -> clear @s gen_head + clear @s gen_chest.
+    This preserves many simple ownership/lock scripts that are implemented with
+    tick.json + mcfunction after an addon is converted into UI variants.
+    """
+    if not multi_item_map:
+        return text
+    out: List[str] = []
+    for line in text.splitlines():
+        keys = [key for key, vals in multi_item_map.items() if key in line and vals]
+        if len(keys) == 1:
+            key = keys[0]
+            for replacement in multi_item_map[key]:
+                out.append(line.replace(key, replacement))
+        else:
+            out.append(line)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def _ui_read_function_tag_values(bp: Path, tag_name: str) -> List[str]:
+    path = bp / "functions" / tag_name
+    if not path.exists():
+        return []
+    try:
+        data = _read_json(path)
+    except Exception:
+        return []
+    values = data.get("values") if isinstance(data, dict) else None
+    if not isinstance(values, list):
+        return []
+    return [str(v) for v in values if isinstance(v, str) and v.strip()]
+
+
+def _ui_collect_script_entries_and_deps(bp: Path) -> Tuple[List[str], List[Dict[str, Any]]]:
+    entries: List[str] = []
+    deps: List[Dict[str, Any]] = []
+    try:
+        manifest = _read_json(bp / "manifest.json")
+    except Exception:
+        return entries, deps
+    for module in manifest.get("modules", []):
+        if isinstance(module, dict) and module.get("type") == "script":
+            entry = module.get("entry")
+            if isinstance(entry, str) and entry:
+                entries.append(entry)
+    for dep in manifest.get("dependencies", []):
+        if isinstance(dep, dict) and dep.get("module_name"):
+            deps.append({"module_name": dep.get("module_name"), "version": dep.get("version", "1.0.0")})
+    return entries, deps
+
+
+def _ui_merge_script_dependencies(dst_bp: Path, deps: List[Dict[str, Any]]) -> None:
+    if not deps:
+        return
+    manifest_path = dst_bp / "manifest.json"
+    manifest = _read_json(manifest_path)
+    existing = manifest.setdefault("dependencies", [])
+    seen = {d.get("module_name") for d in existing if isinstance(d, dict) and d.get("module_name")}
+    for dep in deps:
+        name = dep.get("module_name")
+        if name and name not in seen:
+            existing.append(dep)
+            seen.add(name)
+    _write_json(manifest_path, manifest)
+
+
+def _preserve_source_behaviors_to_ui(
+    sources: List[Dict[str, Any]],
+    dst_bp: Path,
+    generated_item_map: Dict[int, Dict[str, List[str]]],
+    warnings: List[str],
+) -> Tuple[List[str], Dict[str, int]]:
+    """Copy original BP scripts/functions into a generated UI BP.
+
+    Script entry files are imported by the generated scripts/main.js. Function
+    tick/load tags are merged into BP/functions/tick.json and BP/functions/load.json.
+    For mcfunction files, source item ids selected into UI are expanded to all
+    generated target variants where possible.
+    """
+    imports: List[str] = []
+    deps: List[Dict[str, Any]] = []
+    tick_values: List[str] = []
+    load_values: List[str] = []
+    copied_scripts = 0
+    copied_functions = 0
+
+    for source in sources:
+        source_index = int(source.get("index") or 1)
+        bp = Path(source["bp"])
+        multi_map = generated_item_map.get(source_index, {})
+        script_entries, source_deps = _ui_collect_script_entries_and_deps(bp)
+        deps.extend(source_deps)
+        scripts_root = bp / "scripts"
+        if scripts_root.exists():
+            for path in sorted(scripts_root.rglob("*")):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(scripts_root)
+                dst = dst_bp / "scripts" / f"source_s{source_index:02d}" / rel
+                _ui_copy_text_or_binary(path, dst)
+                copied_scripts += 1
+            for entry in script_entries:
+                rel = Path(entry)
+                if rel.parts and rel.parts[0] == "scripts":
+                    rel = rel.relative_to("scripts")
+                imports.append(f'import "./source_s{source_index:02d}/{rel.as_posix()}";')
+                # Script files can be copied and loaded, but if the script is hard-coded
+                # to source item identifiers and the UI generated multiple variants, the
+                # logic may still need creator-side adaptation. Warn only when likely.
+                try:
+                    script_text = (scripts_root / rel).read_text(encoding="utf-8", errors="replace")
+                    if any(old_id in script_text and len(new_ids) > 1 for old_id, new_ids in multi_map.items()):
+                        warnings.append(
+                            f"สคริปต์จากไฟล์ที่ {source_index} อ้างถึง item เดิมที่ถูกแยกเป็นหลายช่อง; "
+                            "บอทโหลดสคริปต์ให้แล้ว แต่สคริปต์บางแบบอาจควบคุมได้ไม่ครบทุก variant"
+                        )
+                except Exception:
+                    pass
+
+        function_map = _ui_collect_function_ref_mapping(bp, source_index)
+        functions_root = bp / "functions"
+        if functions_root.exists():
+            for path in sorted(functions_root.rglob("*.mcfunction")):
+                rel = path.relative_to(functions_root)
+                dst_rel = rel.with_name(f"s{source_index:02d}_{rel.name}")
+                dst = dst_bp / "functions" / dst_rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                text = path.read_text(encoding="utf-8-sig", errors="replace")
+                text = _ui_expand_item_ids_in_mcfunction(text, multi_map)
+                text = _ui_patch_function_calls(text, function_map)
+                dst.write_text(text, encoding="utf-8")
+                copied_functions += 1
+            for value in _ui_read_function_tag_values(bp, "tick.json"):
+                mapped = _ui_map_function_ref(value, function_map)
+                if mapped not in tick_values:
+                    tick_values.append(mapped)
+            for value in _ui_read_function_tag_values(bp, "load.json"):
+                mapped = _ui_map_function_ref(value, function_map)
+                if mapped not in load_values:
+                    load_values.append(mapped)
+
+    if tick_values:
+        (dst_bp / "functions").mkdir(parents=True, exist_ok=True)
+        _write_json(dst_bp / "functions" / "tick.json", {"values": tick_values})
+    if load_values:
+        (dst_bp / "functions").mkdir(parents=True, exist_ok=True)
+        _write_json(dst_bp / "functions" / "load.json", {"values": load_values})
+    _ui_merge_script_dependencies(dst_bp, deps)
+    return list(dict.fromkeys(imports)), {"scripts": copied_scripts, "functions": copied_functions, "tick": len(tick_values), "load": len(load_values)}
+
 def _make_generated_item(identifier: str, icon: str, display_name: str, wearable_slot: str) -> Dict[str, Any]:
     # Armor pieces are real wearable target items used by replaceitem. They must
     # not appear in the Creative inventory. Some Bedrock versions still show
@@ -1970,6 +2176,8 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
     all_item_ids: List[str] = []
     lang_lines: List[str] = [f"item.{selector_id}.name={selector_display_name}"]
     warnings: List[str] = []
+    generated_item_map: Dict[int, Dict[str, List[str]]] = {1: {}}
+    sources_for_behaviors = [{"index": 1, "path": src, "root": root, "bp": src_bp, "rp": src_rp, "name": addon_name}]
     texture_data: Dict[str, Any] = {}
     selector_icon_key: Optional[str] = None
     selector_pack_icon = _prepare_selector_pack_icon(dst_bp, dst_rp, warnings, build_token)
@@ -2018,6 +2226,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
             new_item_name = f"{base}_offhand"
             new_item_id = f"{new_ns}:{new_item_name}"
             all_item_ids.append(new_item_id)
+            generated_item_map.setdefault(1, {}).setdefault(candidate.identifier, []).append(new_item_id)
             armor_entry["items"]["offhand"] = new_item_id
             label = f"{candidate.display_name} (มือซ้าย)"
             item_json = _make_generated_offhand_item(item_data, new_item_id, generated_icon_key, label)
@@ -2038,6 +2247,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
             new_item_name = f"{base}_{slot_key}"
             new_item_id = f"{new_ns}:{new_item_name}"
             all_item_ids.append(new_item_id)
+            generated_item_map.setdefault(1, {}).setdefault(candidate.identifier, []).append(new_item_id)
             armor_entry["items"][slot_key] = new_item_id
             if slot_key == "offhand":
                 label = f"{candidate.display_name} (มือซ้าย)"
@@ -2088,7 +2298,9 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
     })
     _resize_item_icon_tree(dst_rp)
 
-    (dst_bp / "scripts" / "main.js").write_text('import "./auto_ui_system.js";\n', encoding="utf-8")
+    source_imports, behavior_counts = _preserve_source_behaviors_to_ui(sources_for_behaviors, dst_bp, generated_item_map, warnings)
+    main_imports = ['import "./auto_ui_system.js";'] + source_imports
+    (dst_bp / "scripts" / "main.js").write_text("\n".join(main_imports) + "\n", encoding="utf-8")
     (dst_bp / "scripts" / "auto_ui_system.js").write_text(_generate_ui_script(selector_id, armors, all_item_ids, selector_display_name), encoding="utf-8")
 
     unique_lang = list(dict.fromkeys(lang_lines))
@@ -2103,6 +2315,8 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
         f"Selected items: {len(selected)}",
         f"Slot mode: {slot_mode}",
         f"Custom slots: {", ".join(custom_slots or []) if custom_slots else "-"}",
+        f"Preserved source scripts: {behavior_counts.get('scripts', 0)} file(s)",
+        f"Preserved source functions: {behavior_counts.get('functions', 0)} file(s); tick={behavior_counts.get('tick', 0)}, load={behavior_counts.get('load', 0)}",
         "",
         "Converted identifiers:",
     ]
@@ -2206,6 +2420,7 @@ def convert_addons_to_ui(addon_paths: List[str], selected_refs: List[str], work_
     all_item_ids: List[str] = []
     lang_lines: List[str] = [f"item.{selector_id}.name={selector_display_name}"]
     warnings: List[str] = []
+    generated_item_map: Dict[int, Dict[str, List[str]]] = {}
     texture_data: Dict[str, Any] = {}
     selector_icon_key: Optional[str] = None
     selector_pack_icon = _prepare_selector_pack_icon(dst_bp, dst_rp, warnings, build_token)
@@ -2254,6 +2469,7 @@ def convert_addons_to_ui(addon_paths: List[str], selected_refs: List[str], work_
             new_item_name = f"{base}_offhand"
             new_item_id = f"{new_ns}:{new_item_name}"
             all_item_ids.append(new_item_id)
+            generated_item_map.setdefault(source_index, {}).setdefault(candidate.identifier, []).append(new_item_id)
             armor_entry["items"]["offhand"] = new_item_id
             label = f"{candidate.display_name} (มือซ้าย)"
             item_json = _make_generated_offhand_item(item_data, new_item_id, generated_icon_key, label)
@@ -2274,6 +2490,7 @@ def convert_addons_to_ui(addon_paths: List[str], selected_refs: List[str], work_
             new_item_name = f"{base}_{slot_key}"
             new_item_id = f"{new_ns}:{new_item_name}"
             all_item_ids.append(new_item_id)
+            generated_item_map.setdefault(source_index, {}).setdefault(candidate.identifier, []).append(new_item_id)
             armor_entry["items"][slot_key] = new_item_id
             if slot_key == "offhand":
                 label = f"{candidate.display_name} (มือซ้าย)"
@@ -2324,7 +2541,9 @@ def convert_addons_to_ui(addon_paths: List[str], selected_refs: List[str], work_
     })
     _resize_item_icon_tree(dst_rp)
 
-    (dst_bp / "scripts" / "main.js").write_text('import "./auto_ui_system.js";\n', encoding="utf-8")
+    source_imports, behavior_counts = _preserve_source_behaviors_to_ui(sources, dst_bp, generated_item_map, warnings)
+    main_imports = ['import "./auto_ui_system.js";'] + source_imports
+    (dst_bp / "scripts" / "main.js").write_text("\n".join(main_imports) + "\n", encoding="utf-8")
     (dst_bp / "scripts" / "auto_ui_system.js").write_text(_generate_ui_script(selector_id, armors, all_item_ids, selector_display_name), encoding="utf-8")
 
     unique_lang = list(dict.fromkeys(lang_lines))
@@ -2339,6 +2558,8 @@ def convert_addons_to_ui(addon_paths: List[str], selected_refs: List[str], work_
         f"Selected items: {len(selected_records)}",
         f"Slot mode: {slot_mode}",
         f"Custom slots: {', '.join(custom_slots or []) if custom_slots else '-'}",
+        f"Preserved source scripts: {behavior_counts.get('scripts', 0)} file(s)",
+        f"Preserved source functions: {behavior_counts.get('functions', 0)} file(s); tick={behavior_counts.get('tick', 0)}, load={behavior_counts.get('load', 0)}",
         "",
         "Converted identifiers:",
     ]

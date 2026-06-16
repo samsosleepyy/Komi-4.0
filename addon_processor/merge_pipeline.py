@@ -379,7 +379,64 @@ def _relative_dest(rel: Path, prefix: str, *, is_script: bool = False) -> Path:
     return rel.with_name(f'{prefix}_{rel.name}')
 
 
-def _copy_text_or_binary(src: Path, dst: Path, mapping: Dict[str, str]) -> None:
+def _function_output_ref(rel_to_functions: Path, prefix: str) -> str:
+    """Return the function name that a copied .mcfunction will have in BP/functions.
+
+    Bedrock's functions/tick.json must keep exact file name tick.json, while the
+    function files themselves can be prefixed to avoid collisions. Values inside
+    tick.json/load.json need to point at those prefixed function names.
+    """
+    rel = Path('functions') / rel_to_functions
+    dst_rel = _relative_dest(rel, prefix).relative_to('functions')
+    return dst_rel.with_suffix('').as_posix()
+
+
+def _collect_function_ref_mapping(bp: Path, prefix: str) -> Dict[str, str]:
+    functions = bp / 'functions'
+    mapping: Dict[str, str] = {}
+    if not functions.exists():
+        return mapping
+    for fn in sorted(functions.rglob('*.mcfunction')):
+        rel = fn.relative_to(functions)
+        old_ref = rel.with_suffix('').as_posix()
+        new_ref = _function_output_ref(rel, prefix)
+        mapping[old_ref] = new_ref
+        # Many packs refer to functions in tick.json or /function commands by
+        # just the file stem when the function is directly under BP/functions.
+        if len(rel.parts) == 1:
+            mapping[rel.stem] = new_ref
+    return mapping
+
+
+def _map_function_ref(ref: str, function_map: Dict[str, str]) -> str:
+    clean = str(ref or '').strip()
+    if not clean:
+        return clean
+    suffix = ''
+    if clean.endswith('.mcfunction'):
+        clean, suffix = clean[:-11], '.mcfunction'
+    if clean in function_map:
+        return function_map[clean] + suffix
+    if ':' in clean:
+        ns, path = clean.split(':', 1)
+        if path in function_map:
+            return f'{ns}:{function_map[path]}' + suffix
+    return ref
+
+
+def _patch_mcfunction_calls(text: str, function_map: Dict[str, str]) -> str:
+    if not function_map:
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        prefix, ref = match.group(1), match.group(2)
+        return prefix + _map_function_ref(ref, function_map)
+
+    # Patch commands such as: function foo, /function foo, execute ... run function foo
+    return re.sub(r'((?:^|\s)/?function\s+)([^\s#]+)', repl, text)
+
+
+def _copy_text_or_binary(src: Path, dst: Path, mapping: Dict[str, str], function_map: Optional[Dict[str, str]] = None) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if src.suffix.lower() == '.json':
         try:
@@ -391,7 +448,10 @@ def _copy_text_or_binary(src: Path, dst: Path, mapping: Dict[str, str]) -> None:
     if src.suffix.lower() in TEXT_EXTS:
         try:
             text = src.read_text(encoding='utf-8-sig')
-            dst.write_text(_replace_text(text, mapping), encoding='utf-8')
+            text = _replace_text(text, mapping)
+            if src.suffix.lower() == '.mcfunction':
+                text = _patch_mcfunction_calls(text, function_map or {})
+            dst.write_text(text, encoding='utf-8')
             return
         except Exception:
             pass
@@ -399,6 +459,7 @@ def _copy_text_or_binary(src: Path, dst: Path, mapping: Dict[str, str]) -> None:
 
 
 def _copy_pack_files(src_root: Path, dst_root: Path, prefix: str, mapping: Dict[str, str], *, is_bp: bool) -> None:
+    function_map = _collect_function_ref_mapping(src_root, prefix) if is_bp else {}
     for path in sorted(src_root.rglob('*')):
         if not path.is_file():
             continue
@@ -416,10 +477,17 @@ def _copy_pack_files(src_root: Path, dst_root: Path, prefix: str, mapping: Dict[
             continue
         if not is_bp and rel.suffix.lower() == '.lang' and rel.parts and rel.parts[0] == 'texts':
             continue
+        # functions/tick.json and functions/load.json are special entry files.
+        # They must keep their exact file names and be merged across sources later;
+        # if they are renamed to m1_tick.json, Minecraft will never run them.
+        if is_bp and rel.parts == ('functions', 'tick.json'):
+            continue
+        if is_bp and rel.parts == ('functions', 'load.json'):
+            continue
         is_script = is_bp and len(rel.parts) > 0 and rel.parts[0] == 'scripts'
         dst_rel = _relative_dest(rel, prefix, is_script=is_script)
         dst_path = dst_root / dst_rel
-        _copy_text_or_binary(path, dst_path, mapping)
+        _copy_text_or_binary(path, dst_path, mapping, function_map=function_map)
         if rel.name.lower().startswith('pack_icon') and dst_path.suffix.lower() in IMAGE_EXTS:
             _resize_image_file(dst_path)
 
@@ -458,6 +526,41 @@ def _patch_texture_key_refs(root: Path, key_map: Dict[str, str]) -> None:
             continue
         if _patch_texture_key_refs_in_json(data, key_map):
             _write_json(path, data)
+
+def _read_function_tag_values(bp: Path, tag_name: str) -> List[str]:
+    path = bp / 'functions' / tag_name
+    if not path.exists():
+        return []
+    try:
+        data = _read_json(path)
+    except Exception:
+        return []
+    values = data.get('values') if isinstance(data, dict) else None
+    if not isinstance(values, list):
+        return []
+    return [str(v) for v in values if isinstance(v, str) and v.strip()]
+
+
+def _write_merged_function_tags(merged_bp: Path, sources: List[SourcePack]) -> Dict[str, int]:
+    counts = {'tick.json': 0, 'load.json': 0}
+    functions = merged_bp / 'functions'
+    for tag_name in ('tick.json', 'load.json'):
+        merged_values: List[str] = []
+        for source in sources:
+            function_map = _collect_function_ref_mapping(source.bp, source.prefix)
+            for value in _read_function_tag_values(source.bp, tag_name):
+                mapped = _map_function_ref(value, function_map)
+                if mapped not in merged_values:
+                    merged_values.append(mapped)
+        if merged_values:
+            functions.mkdir(parents=True, exist_ok=True)
+            _write_json(functions / tag_name, {'values': merged_values})
+            counts[tag_name] = len(merged_values)
+    return counts
+
+
+def _looks_like_script_or_function_pack(source: SourcePack) -> bool:
+    return bool(source.script_entries or (source.bp / 'functions' / 'tick.json').exists() or (source.bp / 'functions' / 'load.json').exists())
 
 def _merge_item_texture(source: SourcePack, merged_rp: Path) -> Dict[str, Any]:
     path = source.rp / 'textures' / 'item_texture.json'
@@ -852,6 +955,8 @@ def merge_addons(addon_paths: List[str], work_dir: str, pack_name: Optional[str]
         _patch_texture_key_refs(merged_bp, source.texture_key_mapping)
         _patch_texture_key_refs(merged_rp, source.texture_key_mapping)
 
+    function_tag_counts = _write_merged_function_tags(merged_bp, sources)
+
     preserve_hidden_item_ids: Set[str] = set()
     for source in sources:
         preserve_hidden_item_ids.update(source.ui_hidden_item_ids)
@@ -909,6 +1014,7 @@ def merge_addons(addon_paths: List[str], work_dir: str, pack_name: Optional[str]
         'Notes:',
         '- Script folders are isolated under BP_merged/scripts/addon_<prefix>/',
         '- main.js imports the original script entry files from all uploaded addons.',
+        f"- Function tick/load entries merged: tick={function_tag_counts.get('tick.json', 0)}, load={function_tag_counts.get('load.json', 0)}.",
         '- UUIDs are regenerated for the merged BP/RP manifests.',
         '- Identifiers, defined geometry/animations/controllers, texture keys and texture paths are prefixed to reduce collisions.',
         '- Built-in references such as geometry.humanoid.customSlim are preserved.',
