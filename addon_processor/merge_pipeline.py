@@ -653,8 +653,8 @@ def _scan_all_item_metadata(root: Path, bp: Path) -> List[Dict[str, str]]:
 
 
 def inspect_merge_addons(addon_paths: List[str], work_dir: str) -> Dict[str, Any]:
-    if not (1 <= len(addon_paths) <= 5):
-        raise AddonError('ระบบตรวจรวมแอดออนรองรับ 1-5 ไฟล์')
+    if not (1 <= len(addon_paths) <= 10):
+        raise AddonError('ระบบตรวจรวมแอดออนรองรับ 1-10 ไฟล์')
     paths = [Path(p) for p in addon_paths]
     preview_root = Path(work_dir) / 'merge_preview'
     if preview_root.exists():
@@ -769,8 +769,8 @@ def _validate_merged(root: Path) -> List[str]:
 
 
 def merge_addons(addon_paths: List[str], work_dir: str, pack_name: Optional[str] = None, pack_icon_path: Optional[str] = None) -> str:
-    if not (2 <= len(addon_paths) <= 5):
-        raise AddonError('ระบบรวมแอดออนรองรับ 2-5 ไฟล์ต่อครั้ง')
+    if not (1 <= len(addon_paths) <= 10):
+        raise AddonError('ระบบรวมแอดออนรองรับ 1-10 ไฟล์ต่อครั้ง')
     paths = [Path(p) for p in addon_paths]
     for p in paths:
         if not p.exists() or not zipfile.is_zipfile(p):

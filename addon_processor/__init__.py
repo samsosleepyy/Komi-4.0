@@ -1,6 +1,7 @@
 from .pipeline import (
     inspect_addon,
     convert_addon,
+    convert_addons_to_ui,
     inspect_existing_ui_addon,
     edit_existing_ui_addon,
     AddonItemCandidate,

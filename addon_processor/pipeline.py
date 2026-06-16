@@ -739,6 +739,100 @@ def _update_existing_ui_selector_icon_texture(bp: Path, rp: Path, selector_id: s
         _write_resized_icon(icon_src, target)
 
 
+def _get_selector_item_file_and_data(bp: Path, selector_id: str) -> Tuple[Optional[Path], Optional[Dict[str, Any]]]:
+    if not selector_id or not (bp / "items").exists():
+        return None, None
+    for item_path in (bp / "items").rglob("*.json"):
+        try:
+            data = _read_json(item_path)
+        except Exception:
+            continue
+        item = data.get("minecraft:item") if isinstance(data, dict) else None
+        if not isinstance(item, dict):
+            continue
+        desc = item.get("description") if isinstance(item.get("description"), dict) else {}
+        if str(desc.get("identifier") or "") == selector_id:
+            return item_path, data
+    return None, None
+
+
+def _extract_icon_key_from_item_data(data: Dict[str, Any]) -> str:
+    item = data.get("minecraft:item") if isinstance(data, dict) else None
+    if not isinstance(item, dict):
+        return ""
+    comps = item.get("components") if isinstance(item.get("components"), dict) else {}
+    raw_icon = comps.get("minecraft:icon")
+    if isinstance(raw_icon, str):
+        return raw_icon
+    if isinstance(raw_icon, dict):
+        return str(raw_icon.get("texture") or raw_icon.get("default") or "")
+    return ""
+
+
+def _set_icon_key_on_item_data(data: Dict[str, Any], icon_key: str) -> None:
+    item = data.setdefault("minecraft:item", {})
+    comps = item.setdefault("components", {})
+    comps["minecraft:icon"] = icon_key
+
+
+def _texture_ref_for_icon_key(rp: Path, icon_key: str) -> str:
+    if not icon_key:
+        return ""
+    atlas = rp / "textures" / "item_texture.json"
+    if not atlas.exists():
+        return ""
+    try:
+        data = _read_json(atlas)
+        entry = data.get("texture_data", {}).get(icon_key)
+        if isinstance(entry, dict):
+            raw = entry.get("textures")
+            if isinstance(raw, str):
+                return raw
+            if isinstance(raw, list) and raw and isinstance(raw[0], str):
+                return raw[0]
+    except Exception:
+        return ""
+    return ""
+
+
+def _ensure_existing_ui_selector_icon_unique(bp: Path, rp: Path, selector_id: str, warnings: List[str]) -> None:
+    """Upgrade old UI addons so multiple UI selectors do not share one atlas key/path."""
+    item_path, item_data = _get_selector_item_file_and_data(bp, selector_id)
+    if item_path is None or item_data is None:
+        return
+    old_key = _extract_icon_key_from_item_data(item_data)
+    old_ref = _texture_ref_for_icon_key(rp, old_key)
+    if old_key.startswith("auto_ui_pack_icon_") and old_ref.startswith("textures/item/auto_ui_pack_icon_"):
+        return
+
+    token = _safe_id(f"{selector_id.replace(':', '_')}_{uuid4().hex[:8]}", "ui_selector")
+    new_key = f"auto_ui_pack_icon_{token}"
+    new_ref = f"textures/item/{new_key}"
+    new_file = rp / "textures" / "item" / f"{new_key}.png"
+
+    old_file = rp / f"{old_ref}.png" if old_ref.startswith("textures/") else None
+    src: Optional[Path] = None
+    for candidate in (old_file, rp / "textures" / "item" / "auto_ui_pack_icon.png", rp / "pack_icon.png", bp / "pack_icon.png"):
+        if candidate and candidate.exists():
+            src = candidate
+            break
+    if src:
+        _write_resized_icon(src, new_file)
+        atlas_path, atlas = _load_item_texture_data(rp)
+        texture_data = atlas.setdefault("texture_data", {})
+        if not isinstance(texture_data, dict):
+            texture_data = {}
+            atlas["texture_data"] = texture_data
+        texture_data[new_key] = {"textures": new_ref}
+        _write_json(atlas_path, atlas)
+        _set_icon_key_on_item_data(item_data, new_key)
+        _write_json(item_path, item_data)
+        if old_key == "auto_ui_pack_icon" or old_ref == "textures/item/auto_ui_pack_icon":
+            warnings.append("ปรับ icon key/path ของไอเท็ม UI ให้ไม่ซ้ำกับ addon UI อื่นโดยอัตโนมัติ")
+    else:
+        warnings.append("ไม่พบไฟล์ icon เดิมของไอเท็ม UI จึงไม่สามารถอัปเกรด icon key/path ให้ unique ได้")
+
+
 def _slot_label_for_existing_ui(slot_key: str) -> str:
     return _SLOT_LABEL_BY_KEY.get(slot_key, slot_key)
 
@@ -987,13 +1081,16 @@ def edit_existing_ui_addon(
         else:
             warnings.append("ไม่พบไฟล์รูป pack icon ที่เลือกไว้ จึงคงรูปเดิม")
 
+    selector_id = str(cfg.get("menuItem") or "")
+    _ensure_existing_ui_selector_icon_unique(bp, rp, selector_id, warnings)
+
     selector_label = clean_ui_title
-    _update_existing_ui_selector_name(bp, str(cfg.get("menuItem") or ""), selector_label)
+    _update_existing_ui_selector_name(bp, selector_id, selector_label)
     _update_existing_ui_item_display_names(bp, item_labels)
-    _update_existing_ui_lang_names(rp, str(cfg.get("menuItem") or ""), selector_label, item_labels)
+    _update_existing_ui_lang_names(rp, selector_id, selector_label, item_labels)
 
     script.write_text(_replace_json_const_in_js(text, "CONFIG", cfg), encoding="utf-8")
-    _set_existing_ui_creative_visibility(bp, str(cfg.get("menuItem") or ""), set(cfg["allItems"]))
+    _set_existing_ui_creative_visibility(bp, selector_id, set(cfg["allItems"]))
 
     mode_label = {"keep": "คงสถานะเดิม", "all": "แสดงทุกช่องที่มีอยู่", "custom": "กำหนดช่องเอง"}.get(mode, mode)
     report = [
@@ -1011,7 +1108,7 @@ def edit_existing_ui_addon(
         f"Visible item variants in UI: {len(cfg['allItems'])}",
     ]
     if warnings:
-        report.extend(["", "Notes:"])
+        report.extend(["", "Warnings:"])
         report.extend(f"- {w}" for w in warnings)
     (Path(work_dir) / "UI_EDIT_REPORT_WEBHOOK.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
 
@@ -1474,11 +1571,14 @@ def _copy_pack_icon(src_bp: Path, src_rp: Path, dst_bp: Path, dst_rp: Path) -> N
             return
 
 
-def _prepare_selector_pack_icon(dst_bp: Path, dst_rp: Path, warnings: List[str]) -> Optional[Tuple[str, str]]:
+def _prepare_selector_pack_icon(dst_bp: Path, dst_rp: Path, warnings: List[str], unique_token: str) -> Optional[Tuple[str, str]]:
     """Use the output pack icon as the visible inventory icon for the UI item.
 
     The held item model is hidden separately with render_offsets, but the atlas
-    icon remains visible in inventory/Equipment.
+    icon remains visible in inventory/Equipment.  The atlas key and texture path
+    must be unique per generated addon; Minecraft merges item_texture atlases
+    across active resource packs, so a shared key/path like auto_ui_pack_icon can
+    make every UI selector show the icon from whichever pack loads first.
     """
     src = dst_rp / "pack_icon.png"
     if not src.exists():
@@ -1486,9 +1586,10 @@ def _prepare_selector_pack_icon(dst_bp: Path, dst_rp: Path, warnings: List[str])
     if not src.exists():
         warnings.append("ไม่พบ pack_icon.png สำหรับใช้เป็น icon ของไอเท็ม UI; fallback เป็น icon ไอเท็มแรก")
         return None
-    icon_key = "auto_ui_pack_icon"
-    icon_ref = "textures/item/auto_ui_pack_icon"
-    _write_resized_icon(src, dst_rp / "textures" / "item" / "auto_ui_pack_icon.png")
+    token = _safe_id(unique_token or uuid4().hex[:8], "ui")
+    icon_key = f"auto_ui_pack_icon_{token}"
+    icon_ref = f"textures/item/{icon_key}"
+    _write_resized_icon(src, dst_rp / "textures" / "item" / f"{icon_key}.png")
     return icon_key, icon_ref
 
 
@@ -1850,6 +1951,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
 
     addon_name = _addon_base_name(src_bp, src_rp)
     safe_addon = _safe_id(addon_name, "auto_ui")
+    build_token = _safe_id(uuid4().hex[:8], "ui")
     selector_display_name = f"{addon_name} item ui"
 
     dst_bp = out_root / "BP_auto_ui"
@@ -1862,7 +1964,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
     _write_json(dst_rp / "manifest.json", rp_manifest)
     _copy_pack_icon(src_bp, src_rp, dst_bp, dst_rp)
 
-    selector_ns = _safe_id(f"{safe_addon}_ui", "auto_ui")
+    selector_ns = _safe_id(f"{safe_addon}_{build_token}_ui", "auto_ui")
     selector_id = f"{selector_ns}:selector"
     armors: List[Dict[str, Any]] = []
     all_item_ids: List[str] = []
@@ -1870,7 +1972,7 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
     warnings: List[str] = []
     texture_data: Dict[str, Any] = {}
     selector_icon_key: Optional[str] = None
-    selector_pack_icon = _prepare_selector_pack_icon(dst_bp, dst_rp, warnings)
+    selector_pack_icon = _prepare_selector_pack_icon(dst_bp, dst_rp, warnings, build_token)
     if selector_pack_icon:
         selector_icon_key, selector_icon_ref = selector_pack_icon
         texture_data[selector_icon_key] = {"textures": selector_icon_ref}
@@ -1879,8 +1981,8 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
         orig_ns, orig_name = _identifier_parts(candidate.identifier)
         item_kind = getattr(candidate, "item_kind", "wearable")
         base_prefix = "offhand" if item_kind == "offhand" else "armor"
-        base = f"{base_prefix}_{idx:03d}_{orig_ns}_{orig_name}"
-        new_ns = _safe_id(f"{safe_addon}_{idx:03d}", "autoarmor")
+        base = f"{base_prefix}_{build_token}_{idx:03d}_{orig_ns}_{orig_name}"
+        new_ns = _safe_id(f"{safe_addon}_{build_token}_{idx:03d}", "autoarmor")
         item_path = root / candidate.file_path
         try:
             item_data = _read_json(item_path)
@@ -2029,3 +2131,236 @@ def convert_addon(addon_path: str, selected_identifiers: List[str], work_dir: st
         if bad:
             raise AddonError(f"zip validation failed at {bad}")
     return str(out_path)
+
+def convert_addons_to_ui(addon_paths: List[str], selected_refs: List[str], work_dir: str, slot_mode: str = "all", custom_slots: Optional[List[str]] = None) -> str:
+    """Build one UI addon from one or more uploaded normal addons.
+
+    selected_refs values use the format ``<source_index>:<identifier>`` where
+    source_index is 1-based. The function extracts each addon separately and
+    copies only the selected item resource chain into one generated UI addon.
+    """
+    if not (1 <= len(addon_paths) <= 10):
+        raise AddonError("ระบบรวมไอเท็มเป็น UI รองรับ 1-10 ไฟล์ต่อครั้ง")
+    selected_ref_set = {str(x) for x in (selected_refs or []) if str(x)}
+    if not selected_ref_set:
+        raise AddonError("ไม่ได้เลือกไอเท็มที่แปลงได้")
+
+    work = Path(work_dir)
+    sources_root = work / "multi_convert_src"
+    out_root = work / "convert_rebuild"
+    if sources_root.exists():
+        shutil.rmtree(sources_root)
+    if out_root.exists():
+        shutil.rmtree(out_root)
+    sources_root.mkdir(parents=True, exist_ok=True)
+
+    sources: List[Dict[str, Any]] = []
+    selected_records: List[Tuple[int, Path, Path, Path, AddonItemCandidate]] = []
+    pack_names: List[str] = []
+    first_bp: Optional[Path] = None
+    first_rp: Optional[Path] = None
+    for source_index, addon_path in enumerate(addon_paths, start=1):
+        src = Path(addon_path)
+        if not src.exists() or not zipfile.is_zipfile(src):
+            raise AddonError(f"ไฟล์ไม่ใช่ addon/zip ที่เปิดได้: {src.name}")
+        root = sources_root / f"source_{source_index}"
+        _extract_addon_zip(src, root)
+        src_bp, src_rp = _find_packs(root)
+        if first_bp is None:
+            first_bp, first_rp = src_bp, src_rp
+        addon_name = _addon_base_name(src_bp, src_rp)
+        pack_names.append(addon_name)
+        candidates = _scan_candidates(root, src_bp)
+        for c in candidates:
+            if f"{source_index}:{c.identifier}" in selected_ref_set:
+                selected_records.append((source_index, root, src_bp, src_rp, c))
+        sources.append({"index": source_index, "path": src, "root": root, "bp": src_bp, "rp": src_rp, "name": addon_name})
+
+    if not selected_records:
+        raise AddonError("ไม่ได้เลือกไอเท็มที่แปลงได้")
+
+    if len(pack_names) == 1:
+        addon_name = pack_names[0]
+    else:
+        addon_name = " + ".join(pack_names[:2])
+        if len(pack_names) > 2:
+            addon_name += f" + {len(pack_names)-2} addons"
+    safe_addon = _safe_id(addon_name, "auto_ui")
+    build_token = _safe_id(uuid4().hex[:8], "ui")
+    selector_display_name = f"{addon_name} item ui"
+
+    dst_bp = out_root / "BP_auto_ui"
+    dst_rp = out_root / "RP_auto_ui"
+    for d in (dst_bp / "items", dst_bp / "scripts", dst_rp / "attachables", dst_rp / "textures" / "item", dst_rp / "textures" / "models" / "armor", dst_rp / "models" / "entity", dst_rp / "animations", dst_rp / "texts"):
+        d.mkdir(parents=True, exist_ok=True)
+
+    bp_manifest, rp_manifest = _make_manifest_pair(addon_name)
+    _write_json(dst_bp / "manifest.json", bp_manifest)
+    _write_json(dst_rp / "manifest.json", rp_manifest)
+    if first_bp is not None and first_rp is not None:
+        _copy_pack_icon(first_bp, first_rp, dst_bp, dst_rp)
+
+    selector_ns = _safe_id(f"{safe_addon}_{build_token}_ui", "auto_ui")
+    selector_id = f"{selector_ns}:selector"
+    armors: List[Dict[str, Any]] = []
+    all_item_ids: List[str] = []
+    lang_lines: List[str] = [f"item.{selector_id}.name={selector_display_name}"]
+    warnings: List[str] = []
+    texture_data: Dict[str, Any] = {}
+    selector_icon_key: Optional[str] = None
+    selector_pack_icon = _prepare_selector_pack_icon(dst_bp, dst_rp, warnings, build_token)
+    if selector_pack_icon:
+        selector_icon_key, selector_icon_ref = selector_pack_icon
+        texture_data[selector_icon_key] = {"textures": selector_icon_ref}
+
+    for global_idx, (source_index, root, src_bp, src_rp, candidate) in enumerate(selected_records, start=1):
+        orig_ns, orig_name = _identifier_parts(candidate.identifier)
+        item_kind = getattr(candidate, "item_kind", "wearable")
+        base_prefix = "offhand" if item_kind == "offhand" else "armor"
+        base = f"s{source_index:02d}_{base_prefix}_{build_token}_{global_idx:03d}_{orig_ns}_{orig_name}"
+        source_safe = _safe_id(pack_names[source_index-1] if source_index-1 < len(pack_names) else f"source_{source_index}", f"source_{source_index}")
+        new_ns = _safe_id(f"{safe_addon}_{build_token}_s{source_index:02d}_{global_idx:03d}_{source_safe}", "autoarmor")
+        item_path = root / candidate.file_path
+        try:
+            item_data = _read_json(item_path)
+        except Exception:
+            item_data = {}
+        src_attach = _find_attachable_for_item(src_rp, candidate.identifier, candidate.file_path)
+        if not src_attach and item_kind != "offhand":
+            warnings.append(f"ไม่พบ attachable สำหรับ {candidate.identifier}; จะสร้าง attachable พื้นฐาน")
+
+        fallback_texture = ""
+        if src_attach:
+            try:
+                desc = _extract_attachable_desc(src_attach)
+                texs = desc.get("textures", {})
+                if isinstance(texs, dict):
+                    fallback_texture = next((v for v in texs.values() if isinstance(v, str) and v.startswith("textures/") and "enchanted" not in v), "")
+            except Exception:
+                pass
+        icon_key = candidate.icon or f"{base}_icon"
+        generated_icon_key = f"{base}_icon"
+        icon_ref = _copy_icon(src_rp, dst_rp, icon_key, generated_icon_key, fallback_texture, warnings)
+        texture_data[generated_icon_key] = {"textures": icon_ref}
+
+        armor_entry = {
+            "name": candidate.display_name,
+            "icon": icon_ref,
+            "items": {},
+            "kind": item_kind,
+        }
+
+        if item_kind == "offhand":
+            new_item_name = f"{base}_offhand"
+            new_item_id = f"{new_ns}:{new_item_name}"
+            all_item_ids.append(new_item_id)
+            armor_entry["items"]["offhand"] = new_item_id
+            label = f"{candidate.display_name} (มือซ้าย)"
+            item_json = _make_generated_offhand_item(item_data, new_item_id, generated_icon_key, label)
+            _write_json(dst_bp / "items" / f"{new_item_name}.json", item_json)
+            _normalize_attachable_for_item(src_rp, dst_rp, src_attach, new_item_id, base, warnings)
+            lang_lines.append(f"item.{new_item_id}.name={label}")
+            lang_lines.append(f"item.{new_item_name}.name={label}")
+            armors.append(armor_entry)
+            continue
+
+        output_slot_keys = _slot_keys_for_candidate(candidate, slot_mode, custom_slots)
+        if output_slot_keys == ["offhand"]:
+            armor_entry["kind"] = "offhand"
+        if slot_mode == "original" and candidate.wearable_slot not in SLOT_BY_WEARABLE:
+            warnings.append(f"ไม่รู้จัก wearable slot เดิมของ {candidate.identifier}: {candidate.wearable_slot}; fallback เป็นกางเกง")
+        for slot_key in output_slot_keys:
+            wearable_slot = SLOTS_BY_KEY[slot_key][2]
+            new_item_name = f"{base}_{slot_key}"
+            new_item_id = f"{new_ns}:{new_item_name}"
+            all_item_ids.append(new_item_id)
+            armor_entry["items"][slot_key] = new_item_id
+            if slot_key == "offhand":
+                label = f"{candidate.display_name} (มือซ้าย)"
+                item_json = _make_generated_offhand_item(item_data, new_item_id, generated_icon_key, label)
+                _write_json(dst_bp / "items" / f"{new_item_name}.json", item_json)
+                _normalize_attachable_for_item(src_rp, dst_rp, src_attach, new_item_id, base, warnings)
+            else:
+                label = _lang_label(candidate.display_name, slot_key)
+                item_json = _make_generated_item(new_item_id, generated_icon_key, label, wearable_slot)
+                _write_json(dst_bp / "items" / f"{new_item_name}.json", item_json)
+                _normalize_attachable_for_slot(src_rp, dst_rp, src_attach, new_item_id, base, slot_key, warnings)
+            lang_lines.append(f"item.{new_item_id}.name={label}")
+            lang_lines.append(f"item.{new_item_name}.name={label}")
+        armors.append(armor_entry)
+
+    selector_item = {
+        "format_version": "1.20.50",
+        "minecraft:item": {
+            "description": {
+                "identifier": selector_id,
+                "menu_category": {"category": "equipment"},
+            },
+            "components": {
+                "minecraft:icon": selector_icon_key or next(iter(texture_data.keys()), "diamond"),
+                "minecraft:display_name": {"value": selector_display_name},
+                "minecraft:max_stack_size": 1,
+                "minecraft:allow_off_hand": True,
+                "minecraft:render_offsets": {
+                    "main_hand": {
+                        "first_person": {"scale": [0.0, 0.0, 0.0]},
+                        "third_person": {"scale": [0.0, 0.0, 0.0]},
+                    },
+                    "off_hand": {
+                        "first_person": {"scale": [0.0, 0.0, 0.0]},
+                        "third_person": {"scale": [0.0, 0.0, 0.0]},
+                    },
+                },
+            },
+        },
+    }
+    _write_json(dst_bp / "items" / "addon_ui_selector.json", selector_item)
+    _normalize_creative_visibility(dst_bp / "items", selector_id)
+
+    _write_json(dst_rp / "textures" / "item_texture.json", {
+        "resource_pack_name": "auto_ui",
+        "texture_name": "atlas.items",
+        "texture_data": texture_data,
+    })
+    _resize_item_icon_tree(dst_rp)
+
+    (dst_bp / "scripts" / "main.js").write_text('import "./auto_ui_system.js";\n', encoding="utf-8")
+    (dst_bp / "scripts" / "auto_ui_system.js").write_text(_generate_ui_script(selector_id, armors, all_item_ids, selector_display_name), encoding="utf-8")
+
+    unique_lang = list(dict.fromkeys(lang_lines))
+    for lang_name in ["en_US.lang", "th_TH.lang"]:
+        (dst_rp / "texts" / lang_name).write_text("\n".join(unique_lang) + "\n", encoding="utf-8")
+    (dst_rp / "texts" / "languages.json").write_text(json.dumps(["en_US", "th_TH"], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    report = [
+        "Multi-source Normalize/Rebuild Mode report",
+        f"Sources: {len(addon_paths)}",
+        f"Addon name: {addon_name}",
+        f"Selected items: {len(selected_records)}",
+        f"Slot mode: {slot_mode}",
+        f"Custom slots: {', '.join(custom_slots or []) if custom_slots else '-'}",
+        "",
+        "Converted identifiers:",
+    ]
+    for armor in armors:
+        report.append(f"- {armor['name']}")
+        for slot_key, item_id in armor["items"].items():
+            report.append(f"  {slot_key}: {item_id}")
+    if warnings:
+        report.extend(["", "Warnings:"])
+        report.extend(f"- {w}" for w in warnings)
+    (Path(work_dir) / "NORMALIZE_REPORT_WEBHOOK.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
+
+    out_path = Path(work_dir) / ("converted_combined_ui.mcaddon" if len(addon_paths) > 1 else f"converted_{Path(addon_paths[0]).stem}.mcaddon")
+    if out_path.exists():
+        out_path.unlink()
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(out_root.rglob("*")):
+            if path.is_file():
+                zf.write(path, path.relative_to(out_root).as_posix())
+    with zipfile.ZipFile(out_path, "r") as zf:
+        bad = zf.testzip()
+        if bad:
+            raise AddonError(f"zip validation failed at {bad}")
+    return str(out_path)
+
